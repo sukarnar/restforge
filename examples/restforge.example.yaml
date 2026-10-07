@@ -34,11 +34,11 @@ sources:
   hr:
     type: sql
     description: ''
-    url: ${ENV:HR_DB_URL}
     read_only: false
     pool_size: 5
     headers: {}
     timeout_seconds: 10.0
+    credential: hr_db
   sales:
     type: file
     description: ''
@@ -57,7 +57,7 @@ sources:
     module: handlers.pricing
   jsonph:
     type: rest
-    description: ''
+    description: Add --credential <name> for authenticated upstream APIs
     read_only: true
     pool_size: 5
     base_url: https://jsonplaceholder.typicode.com

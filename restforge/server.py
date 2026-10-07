@@ -12,7 +12,9 @@ from pydantic import BaseModel, Field
 
 from . import sources as _sources  # noqa: F401 (registers built-in adapters)
 from .builder import EndpointBuilder
-from .config import DEFAULT_CONFIG, ConfigError, ProjectConfig
+from .config import DEFAULT_CONFIG, ConfigError, ProjectConfig, credential_refs
+from .credentials import CredentialError, CredentialManager, install_redaction
+from .credentials.manager import expiring_soon
 from .security.audit import AuditLogger
 from .security.auth import Authenticator
 from .security.middleware import SecurityMiddleware
@@ -27,9 +29,20 @@ class TokenRequest(BaseModel):
     password: str = Field(max_length=256)
 
 
+def _referenced_credentials(config: ProjectConfig) -> set[str]:
+    names: set[str] = set(credential_refs(config.security.jwt.secret))
+    for spec in config.sources.values():
+        if spec.credential:
+            names.add(spec.credential)
+        names.update(spec.credentials)
+        names |= credential_refs(spec.url) | credential_refs(spec.headers) | credential_refs(spec.base_url)
+    return names
+
+
 def create_app(config: ProjectConfig | str | Path = DEFAULT_CONFIG,
                project_root: str | Path | None = None,
-               limiter: RateLimiter | None = None) -> FastAPI:
+               limiter: RateLimiter | None = None,
+               credentials: CredentialManager | None = None) -> FastAPI:
     if not isinstance(config, ProjectConfig):
         cfg_path = Path(config)
         project_root = project_root or cfg_path.resolve().parent
@@ -37,9 +50,23 @@ def create_app(config: ProjectConfig | str | Path = DEFAULT_CONFIG,
     project_root = str(project_root or Path.cwd())
     sec = config.security
 
-    data_sources = {name: create_source(name, spec, sec, project_root)
+    # ------------------------------------------------ credential management
+    credentials = credentials or CredentialManager.from_settings(sec.credentials, project_root)
+    install_redaction(credentials)
+    cred_problems = []
+    for name in sorted(_referenced_credentials(config)):
+        try:
+            credentials.get(name, consumer="startup-check")
+        except CredentialError as exc:
+            cred_problems.append(str(exc))
+    if cred_problems:
+        raise ConfigError("Credential problems:\n  - " + "\n  - ".join(cred_problems))
+    for c in expiring_soon(credentials.list()):
+        log.warning("credential '%s' expires on %s – rotate it soon", c.name, c.expires)
+
+    data_sources = {name: create_source(name, spec, sec, project_root, credentials)
                     for name, spec in config.sources.items()}
-    authenticator = Authenticator(config)
+    authenticator = Authenticator(config, credentials)
     limiter = limiter or InMemoryRateLimiter()
     audit_path = str(Path(project_root) / sec.audit_log) if sec.audit_log else None
     audit = AuditLogger(audit_path)
@@ -69,6 +96,7 @@ def create_app(config: ProjectConfig | str | Path = DEFAULT_CONFIG,
     )
     app.state.config = config
     app.state.sources = data_sources
+    app.state.credentials = credentials
 
     # ---------------------------------------------------------- middleware
     if sec.cors_origins:
@@ -96,6 +124,14 @@ def create_app(config: ProjectConfig | str | Path = DEFAULT_CONFIG,
         authenticator.require(request, ["admin"], public=False)
         return [{"name": e.name, "method": e.method, "path": base + e.path, "source": e.source,
                  "public": e.public, "scopes": e.scopes} for e in config.endpoints]
+
+    @app.get(f"{base}/_meta/credentials", tags=["system"])
+    async def list_credentials(request: Request):
+        """Inventory only – names, types, providers, expiry, consumers. Never secrets."""
+        authenticator.require(request, ["admin"], public=False)
+        return [{"name": c.name, "type": c.type, "provider": c.provider, "expires": c.expires,
+                 "updated": c.updated, "used_by": sorted(credentials.usage.get(c.name, set()) - {"startup-check"})}
+                for c in credentials.list()]
 
     if "jwt" in sec.auth_methods:
         @app.post(f"{base}/auth/token", tags=["auth"])

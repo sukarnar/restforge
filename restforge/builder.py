@@ -19,6 +19,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ValidationError, create_model
 
 from .config import EndpointSpec, ProjectConfig
+from .credentials.types import CredentialError
 from .security.audit import AuditLogger
 from .security.auth import Authenticator
 from .security.ratelimit import RateLimiter
@@ -183,6 +184,11 @@ class EndpointBuilder:
                 if exc.__cause__:
                     log.error("request %s failed in source '%s'", request_id, ep.source, exc_info=exc.__cause__)
                 return JSONResponse({"error": str(exc), "request_id": request_id}, status_code=status_code)
+            except CredentialError as exc:
+                status_code = 500
+                log.error("credential error in endpoint '%s' (request %s): %s", ep.name, request_id, exc)
+                return JSONResponse({"error": "Server credential configuration error", "request_id": request_id},
+                                    status_code=500)
             except Exception:
                 log.exception("unhandled error in endpoint '%s' (request %s)", ep.name, request_id)
                 return JSONResponse({"error": "Internal server error", "request_id": request_id}, status_code=500)

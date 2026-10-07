@@ -15,11 +15,11 @@ pip install -e .[postgres]  # or [mysql], [oracle] for DB drivers
 
 ```bash
 restforge init hr-api --name hr-api && cd hr-api
-# .env already contains a generated RESTFORGE_JWT_SECRET; add your DB URL there:
-echo HR_DB_URL=sqlite:///data/hr.db >> .env
+# .env already contains a generated JWT secret and vault master key
+restforge cred add hr_db -t database -f driver=sqlite -f database=data/hr.db
 
 # 1. data sources
-restforge source add hr      --type sql      --url '${ENV:HR_DB_URL}' --read-write
+restforge source add hr      --type sql      --credential hr_db --read-write
 restforge source add sales   --type file     --path sales.csv              # under ./data
 restforge source add pricing --type callable --module handlers.pricing     # ./handlers/pricing.py
 restforge source add todos   --type rest     --base-url https://jsonplaceholder.typicode.com --allow-host
@@ -53,6 +53,52 @@ curl -X POST -H "Authorization: Bearer $TOKEN" -H 'content-type: application/jso
      -d '{"name":"Dev","dept":"ENG","salary":120000}' localhost:8080/api/employees
 ```
 
+## Credential management
+Connection secrets (DB logins, API tokens, OAuth clients…) are stored as **typed, encrypted credentials** and
+referenced by name – they never appear in `restforge.yaml`.
+
+```bash
+restforge cred types                                   # database | basic | bearer | api_key | oauth2 | generic
+
+# Oracle login – password is prompted (hidden) and special characters are escaped for you
+restforge cred add hr_oracle -t database -f driver=oracle+oracledb -f host=db.corp.local -f port=1521 \
+    -f service_name=ORCLPDB1 -f username=hr_api -f schema=hr --expires-days 90
+restforge cred test hr_oracle                          # real login check
+restforge source add hr -t sql --credential hr_oracle
+
+# Upstream APIs
+restforge cred add crm_token -t bearer                 # prompts for token
+restforge cred add weather -t api_key -f query_param=appid
+restforge cred add erp -t oauth2 -f token_url=https://login.corp.com/oauth2/token -f client_id=restforge -f scope=api.read
+restforge source add crm -t rest --base-url https://api.crm.com --allow-host --credential crm_token
+
+# Anything else: reference fields anywhere in the config
+restforge cred add partner -t generic --secret signing_key -f tenant=acme
+restforge source add partner -t rest --base-url https://api.partner.com --allow-host \
+    --header 'X-Tenant=${CRED:partner.tenant}' --header 'X-Signature=${CRED:partner.signing_key}'
+
+# Python handlers get ONLY the credentials you allow
+restforge source add billing -t callable --module handlers.billing --allow-credential stripe
+#   def charge(amount: int, ctx=None): key = ctx.credentials.field("stripe", "key")
+
+restforge cred list          # names, types, expiry, which sources use them – never secrets
+restforge cred show NAME     # masked; --reveal asks for confirmation
+restforge cred rotate NAME   # new secret; running servers pick it up and rebuild pools, no restart
+restforge cred rekey         # re-encrypt the whole vault under a new master key
+restforge cred remove NAME   # refuses while a source still uses it
+```
+
+**Where credentials live** (`security.credentials.providers`, checked in order – first match wins):
+
+| Provider | Use for | Setup |
+|---|---|---|
+| `vault` (default) | Local/VPS installs. `.restforge/credentials.vault`, AES-256-GCM per credential | master key in `.env` (`RESTFORGE_MASTER_KEY`, created by `init`) |
+| `env` (default) | Docker/Kubernetes/CI. `RF_CRED_<NAME>_TYPE`, `RF_CRED_<NAME>_<FIELD>` | set env vars |
+| `keyring` | Windows Credential Manager / macOS Keychain | `pip install -e .[keyring]` |
+| `hashicorp` | Enterprise secret store (KV v2) | `VAULT_ADDR`, `VAULT_TOKEN` |
+
+Non-interactive (CI): `restforge cred add db -t database ... --secret-from-env password=DB_PASSWORD`.
+
 ## CLI reference
 | Command | Purpose |
 |---|---|
@@ -63,6 +109,8 @@ curl -X POST -H "Authorization: Bearer $TOKEN" -H 'content-type: application/jso
 | `endpoint list/show/remove` | Inspect and manage endpoints |
 | `key create/list/revoke` | API keys (plaintext shown once, hash stored, default 90-day expiry) |
 | `user add/remove` | Users for JWT login (`POST /api/auth/token`) |
+| `cred init/types/add/list/show/rotate/test/rekey/remove` | Connection credentials (see above) |
+| `source set-credential SOURCE [CRED]` | Attach/detach a credential on an existing source |
 | `validate` | Full build of the app without serving – use in CI |
 | `serve [--reload] [--workers]` | Run with uvicorn |
 
@@ -94,6 +142,7 @@ pip install -e .[dev] && pytest
 ## Production checklist
 * Run behind TLS (Traefik/Nginx) or set `server.ssl_certfile/ssl_keyfile`.
 * Use least-privilege DB accounts; keep SQL sources `read_only` unless writes are required.
+* Back up `RESTFORGE_MASTER_KEY` (password manager) – without it the vault cannot be decrypted.
 * Keep `.env` out of Git; rotate API keys (`key revoke` + `key create`).
 * Set `security.expose_docs: false` if the OpenAPI schema should not be public.
 * With multiple workers/instances, plug in a shared (Redis) `RateLimiter`.

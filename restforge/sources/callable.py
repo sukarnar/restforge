@@ -8,6 +8,8 @@ Security properties:
   ``prefix.`` package) can be imported – arbitrary import strings are refused.
 * The function receives only validated, declared params; it receives ``ctx``
   (incl. the authenticated principal) only if it declares a ``ctx`` argument.
+* ``ctx.credentials`` exposes ONLY the credentials listed in the source's
+  ``credentials:`` list:  ``ctx.credentials.field("crm_api", "token")``.
 """
 from __future__ import annotations
 
@@ -70,6 +72,8 @@ class CallableSource(DataSource):
         sig = inspect.signature(fn)
         kwargs = {k: v for k, v in ctx.params.items() if k in sig.parameters}
         if "ctx" in sig.parameters:
+            if self.spec.credentials and self.credentials is not None:
+                ctx.credentials = self.credentials.scoped(self.spec.credentials, f"source:{self.name}")
             kwargs["ctx"] = ctx
         if inspect.iscoroutinefunction(fn):
             return await fn(**kwargs)

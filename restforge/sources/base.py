@@ -36,6 +36,7 @@ class ExecutionContext:
     limit: int = 100
     offset: int = 0
     request_id: str = ""
+    credentials: Any = None          # ScopedCredentials (callable sources only)
     extra: dict[str, Any] = field(default_factory=dict)
 
 
@@ -44,11 +45,26 @@ class DataSource(ABC):
 
     type_name: ClassVar[str] = ""
 
-    def __init__(self, name: str, spec: SourceSpec, security: SecuritySettings, project_root: str = "."):
+    def __init__(self, name: str, spec: SourceSpec, security: SecuritySettings, project_root: str = ".",
+                 credentials: Any = None):
         self.name = name
         self.spec = spec
         self.security = security
         self.project_root = project_root
+        self.credentials = credentials   # CredentialManager (or None)
+
+    def credential(self):
+        """The managed credential bound to this source (``spec.credential``), if any."""
+        if not self.spec.credential:
+            return None
+        if self.credentials is None:
+            raise SourceError("credential manager not configured", 500)
+        return self.credentials.get(self.spec.credential, consumer=f"source:{self.name}")
+
+    def resolve(self, value):
+        """Resolve ${ENV:..} and ${CRED:..} references in a spec value."""
+        from ..config import resolve_secrets
+        return resolve_secrets(value, self.credentials)
 
     # lifecycle ------------------------------------------------------------
     async def startup(self) -> None:  # open pools / clients
@@ -93,14 +109,15 @@ def _load_plugins() -> None:
         pass
 
 
-def create_source(name: str, spec: SourceSpec, security: SecuritySettings, project_root: str = ".") -> DataSource:
+def create_source(name: str, spec: SourceSpec, security: SecuritySettings, project_root: str = ".",
+                  credentials: Any = None) -> DataSource:
     if spec.type not in _REGISTRY:
         _load_plugins()
     try:
         cls = _REGISTRY[spec.type]
     except KeyError:
         raise ValueError(f"No adapter registered for source type '{spec.type}'") from None
-    return cls(name, spec, security, project_root)
+    return cls(name, spec, security, project_root, credentials)
 
 
 def registered_types() -> list[str]:

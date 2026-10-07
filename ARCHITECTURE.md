@@ -12,6 +12,7 @@ The framework combines a small number of well-known patterns, each with one job:
 | Turning specs into routes | **Builder**. `EndpointBuilder` generates FastAPI routes, pydantic validators and OpenAPI docs from each `EndpointSpec`. | `builder.py` |
 | Per-request processing | **Pipeline / Chain of Responsibility**. Every request, whatever the source, goes through the same ordered stages. | `EndpointBuilder._make_handler` |
 | Authentication | **Strategy** (API key, JWT; add OIDC/mTLS/LDAP as new classes) chained by an `Authenticator`. | `security/auth.py` |
+| Connection secrets | **Credential Manager façade over a provider chain (Strategy)** – vault, env, OS keyring, HashiCorp Vault – with typed credentials and builders that turn them into SQLAlchemy URLs / HTTP auth. | `credentials/` |
 | Swappable infrastructure | **Interface + dependency injection** for rate limiter, audit sink, sources. | `RateLimiter`, `create_app(...)` |
 | Wiring | **Application Factory**. `create_app(config)` builds a fully isolated app – easy to test, embed, or run multiple tenants. | `server.py` |
 
@@ -46,6 +47,10 @@ restforge/
     files.py         CSV / JSON / JSONL / XLSX, sandboxed to data_root
     rest.py          Upstream HTTP facade with SSRF protection
     callable.py      Allow-listed Python functions (sync or async)
+  credentials/
+    types.py         Credential types, validation, SQL URL + HTTP auth builders (OAuth2 flow)
+    providers.py     Encrypted file vault, env, OS keyring, HashiCorp Vault KV v2
+    manager.py       CredentialManager (chain, cache, expiry, rotation, scoping, log redaction)
   security/
     auth.py          Principal, AuthStrategy, ApiKeyStrategy, JwtStrategy, Authenticator
     hashing.py       API-key + scrypt password hashing
@@ -76,7 +81,22 @@ restforge/
 * REST upstream: host allow-list (deny by default), no redirects, URL-encoded path params, only declared params forwarded, caller credentials never forwarded, timeouts and response size caps.
 * Callables: module allow-list, private functions refused, only declared params passed.
 
-**Secrets** – never in YAML: `${ENV:VAR}` references resolved at runtime from the environment or a `chmod 600` `.env` (git-ignored by `init`). Swap in Vault/AWS Secrets Manager by extending `resolve_secrets`.
+**Secrets / connection credentials** – never in YAML. Sources reference a credential by name (`credential: hr_oracle`) or a field (`${CRED:name.field}`); `${ENV:VAR}` is still supported.
+* *Typed*: `database`, `basic`, `bearer`, `api_key`, `oauth2`, `generic` – required/secret fields are validated; builders create the SQLAlchemy URL (correct escaping of special characters) or the HTTP auth (OAuth2 client-credentials tokens fetched, cached, refreshed early and on 401).
+* *Encrypted at rest*: AES-256-GCM per credential, unique nonce, name+type bound as associated data (blobs can't be swapped or edited undetected), key-check record detects a wrong master key, atomic writes, file mode 600. Master key lives only in the environment (or is a scrypt-stretched passphrase); `cred rekey` rotates it.
+* *Least privilege*: callables see only credentials listed on their source (`ScopedCredentials`); OAuth token hosts must be allow-listed.
+* *Lifecycle*: expiry dates with startup warnings and hard failure when expired; `cred rotate` is picked up by running servers within `cache_ttl_seconds`, which rebuild DB pools / HTTP clients without restart; `cred remove` refuses while in use.
+* *Fail fast*: every referenced credential is resolved at startup; a missing/expired/locked one aborts the boot with a clear message.
+* *No leaks*: credentials have a secret-free `repr`; a logging filter scrubs every loaded secret value and URL passwords from log lines and tracebacks; `/_meta/credentials` (admin) shows inventory and usage only.
+
+```mermaid
+flowchart LR
+  YAML["source: credential: hr_oracle"] --> CM[CredentialManager<br/>cache · expiry · scoping · redaction]
+  CM --> V[vault<br/>AES-256-GCM file] & E[env vars] & K[OS keyring] & H[HashiCorp Vault]
+  CM --> B1[build_sql_url] --> SQL[(SQL pool)]
+  CM --> B2[build_http_auth<br/>basic · bearer · api_key · oauth2] --> HTTP[upstream client]
+  CM --> SC[ScopedCredentials] --> FN[callable handlers]
+```
 
 **Errors & observability** – adapters raise client-safe `SourceError`s; anything unexpected becomes a generic 500 with a `request_id`, details are logged server-side only. Every call is audited (who, what, status, latency, IP) without bodies or credentials.
 
@@ -98,7 +118,7 @@ Publish it as a package with `[project.entry-points."restforge.sources"] mongo =
 
 ## 5. Production roadmap
 1. **Distributed rate limiting** – Redis implementation of `RateLimiter` (needed with >1 worker/instance).
-2. **Credential store** – move API keys/users from YAML to a DB table; add OIDC (Azure AD/Okta) `AuthStrategy`.
+2. **Identity store** – move API keys/users from YAML to a DB table; add OIDC (Azure AD/Okta) `AuthStrategy`. Add Azure Key Vault / AWS Secrets Manager credential providers (same `CredentialProvider` interface).
 3. **Hot reload** of `restforge.yaml` without restart (currently `serve --reload` in dev).
 4. **Response caching** per endpoint (TTL) and ETags.
 5. **Row-level security** – inject principal attributes (tenant, region) as mandatory SQL binds.

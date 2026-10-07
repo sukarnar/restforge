@@ -10,14 +10,16 @@ Security properties:
 from __future__ import annotations
 
 import re
+import threading
 from typing import Any
 
 import anyio
-from sqlalchemy import MetaData, Table, create_engine, delete, insert, select, text, update
-from sqlalchemy.engine import Engine
+from sqlalchemy import MetaData, Table, create_engine, delete, insert, literal, select, text, update
+from sqlalchemy.engine import Engine, make_url
 from sqlalchemy.exc import NoSuchTableError, SQLAlchemyError
 
-from ..config import EndpointSpec, resolve_secrets
+from ..config import EndpointSpec
+from ..credentials.types import build_sql_url
 from .base import DataSource, ExecutionContext, NotFound, SourceError, register
 
 _IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_$.]{0,127}$")
@@ -36,13 +38,37 @@ class SqlSource(DataSource):
     def __init__(self, *a, **kw):
         super().__init__(*a, **kw)
         self._tables: dict[str, Table] = {}
+        self._default_schema: str | None = None
+        self._cred_version: str | None = None
+        self._rotate_lock = threading.Lock()
+
+    def _build_engine(self) -> None:
+        cred = self.credential()
+        if cred is not None:
+            url = build_sql_url(cred)                       # escapes special characters safely
+            self._default_schema = cred.fields.get("schema") or None
+            self._cred_version = cred.updated
+        else:
+            url = make_url(self.resolve(self.spec.url))
+        kwargs: dict[str, Any] = {"pool_pre_ping": True}
+        if not url.drivername.startswith("sqlite"):
+            kwargs["pool_size"] = self.spec.pool_size
+        old, self.engine = self.engine, create_engine(url, **kwargs)
+        self._tables.clear()
+        if old is not None:
+            old.dispose()                                    # drain connections using old secret
 
     async def startup(self) -> None:
-        url = resolve_secrets(self.spec.url)
-        kwargs: dict[str, Any] = {"pool_pre_ping": True}
-        if not url.startswith("sqlite"):
-            kwargs["pool_size"] = self.spec.pool_size
-        self.engine = create_engine(url, **kwargs)
+        self._build_engine()
+
+    def _refresh_if_rotated(self) -> None:
+        """Zero-downtime rotation: if the credential changed, rebuild the pool."""
+        if self.spec.credential:
+            cred = self.credential()
+            if cred.updated != self._cred_version:
+                with self._rotate_lock:
+                    if cred.updated != self._cred_version:
+                        self._build_engine()
 
     async def shutdown(self) -> None:
         if self.engine:
@@ -51,7 +77,7 @@ class SqlSource(DataSource):
     async def health(self) -> bool:
         def _ping() -> bool:
             with self.engine.connect() as c:
-                c.execute(text("SELECT 1"))
+                c.execute(select(literal(1)))  # dialect-neutral (Oracle needs FROM DUAL)
             return True
         try:
             return await anyio.to_thread.run_sync(_ping)
@@ -90,7 +116,8 @@ class SqlSource(DataSource):
         if name not in self._tables:
             schema, _, tbl = name.rpartition(".")
             try:
-                self._tables[name] = Table(tbl, MetaData(), schema=schema or None, autoload_with=self.engine)
+                self._tables[name] = Table(tbl, MetaData(), schema=schema or self._default_schema,
+                                           autoload_with=self.engine)
             except NoSuchTableError:
                 raise SourceError(f"Configured table '{name}' does not exist", 500) from None
         return self._tables[name]
@@ -108,6 +135,7 @@ class SqlSource(DataSource):
         return await anyio.to_thread.run_sync(self._execute_sync, ctx)
 
     def _execute_sync(self, ctx: ExecutionContext) -> Any:
+        self._refresh_if_rotated()
         ep = ctx.endpoint
         op = ep.operation or "query"
         try:

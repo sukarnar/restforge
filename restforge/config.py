@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 DEFAULT_CONFIG = "restforge.yaml"
 _ENV_REF = re.compile(r"\$\{ENV:([A-Za-z_][A-Za-z0-9_]*)\}")
+_CRED_REF = re.compile(r"\$\{CRED:([a-zA-Z][a-zA-Z0-9_\-]{0,63})\.([a-zA-Z_][a-zA-Z0-9_]{0,63})\}")
 _NAME = r"^[a-zA-Z][a-zA-Z0-9_\-]{0,63}$"
 
 
@@ -23,20 +24,41 @@ class ConfigError(Exception):
     """Raised when the specification is invalid or a secret cannot be resolved."""
 
 
-def resolve_secrets(value: Any) -> Any:
-    """Replace ``${ENV:VAR}`` references with environment values (recursively)."""
+def resolve_secrets(value: Any, credentials: Any = None) -> Any:
+    """Resolve secret references recursively.
+
+    * ``${ENV:VAR}``          – environment variable
+    * ``${CRED:name.field}``  – field of a managed credential (needs a CredentialManager)
+    """
     if isinstance(value, str):
-        def _sub(m: re.Match) -> str:
+        def _env(m: re.Match) -> str:
             name = m.group(1)
             if name not in os.environ:
                 raise ConfigError(f"Environment variable '{name}' is not set")
             return os.environ[name]
-        return _ENV_REF.sub(_sub, value)
+
+        def _cred(m: re.Match) -> str:
+            if credentials is None:
+                raise ConfigError("${CRED:...} reference used but no credential manager is configured")
+            return str(credentials.field(m.group(1), m.group(2)))
+
+        return _CRED_REF.sub(_cred, _ENV_REF.sub(_env, value))
     if isinstance(value, dict):
-        return {k: resolve_secrets(v) for k, v in value.items()}
+        return {k: resolve_secrets(v, credentials) for k, v in value.items()}
     if isinstance(value, list):
-        return [resolve_secrets(v) for v in value]
+        return [resolve_secrets(v, credentials) for v in value]
     return value
+
+
+def credential_refs(value: Any) -> set[str]:
+    """Names of credentials referenced via ``${CRED:name.field}`` inside a value."""
+    if isinstance(value, str):
+        return {m.group(1) for m in _CRED_REF.finditer(value)}
+    if isinstance(value, dict):
+        return set().union(*(credential_refs(v) for v in value.values())) if value else set()
+    if isinstance(value, list):
+        return set().union(*(credential_refs(v) for v in value)) if value else set()
+    return set()
 
 
 # --------------------------------------------------------------------------- #
@@ -87,6 +109,10 @@ class ParamSpec(BaseModel):
 class SourceSpec(BaseModel):
     type: Literal["sql", "file", "rest", "callable"]
     description: str = ""
+    # managed credential used to connect/authenticate (see `restforge cred`)
+    credential: str | None = None
+    # callable only: credentials the handler may read via ctx.credentials
+    credentials: list[str] = Field(default_factory=list)
     # sql
     url: str | None = None
     read_only: bool = True
@@ -103,10 +129,14 @@ class SourceSpec(BaseModel):
 
     @model_validator(mode="after")
     def _check(self) -> "SourceSpec":
-        required = {"sql": "url", "file": "path", "rest": "base_url"}
+        if self.type == "sql" and not (self.url or self.credential):
+            raise ValueError("source type 'sql' requires 'url' or 'credential'")
+        required = {"file": "path", "rest": "base_url"}
         field = required.get(self.type)
         if field and not getattr(self, field):
             raise ValueError(f"source type '{self.type}' requires '{field}'")
+        if self.credentials and self.type != "callable":
+            raise ValueError("'credentials' (list) is only for callable sources; use 'credential'")
         return self
 
 
@@ -209,7 +239,28 @@ class RateLimitSettings(BaseModel):
     login_requests: int = 5               # brute-force protection on /auth/token
 
 
+class HashiCorpVaultSettings(BaseModel):
+    url: str = "${ENV:VAULT_ADDR}"
+    token: str = "${ENV:VAULT_TOKEN}"
+    mount: str = "secret"                 # KV v2 mount point
+    path_prefix: str = "restforge"        # secrets at <mount>/data/<prefix>/<name>
+    namespace: str | None = None
+    verify_tls: bool = True
+
+
+class CredentialSettings(BaseModel):
+    # Providers are consulted in order; the first that has the credential wins.
+    providers: list[Literal["vault", "env", "keyring", "hashicorp"]] = Field(
+        default_factory=lambda: ["vault", "env"])
+    vault_path: str = ".restforge/credentials.vault"
+    master_key_env: str = "RESTFORGE_MASTER_KEY"
+    cache_ttl_seconds: int = 300
+    keyring_service: str = "restforge"
+    hashicorp: HashiCorpVaultSettings = Field(default_factory=HashiCorpVaultSettings)
+
+
 class SecuritySettings(BaseModel):
+    credentials: CredentialSettings = Field(default_factory=CredentialSettings)
     auth_methods: list[Literal["api_key", "jwt"]] = Field(default_factory=lambda: ["api_key", "jwt"])
     api_key_header: str = "X-API-Key"
     jwt: JwtSettings = Field(default_factory=JwtSettings)

@@ -71,9 +71,9 @@ class ApiKeyStrategy(AuthStrategy):
 class JwtStrategy(AuthStrategy):
     name = "jwt"
 
-    def __init__(self, config: ProjectConfig):
+    def __init__(self, config: ProjectConfig, credentials=None):
         self.settings = config.security.jwt
-        self.secret = resolve_secrets(self.settings.secret)
+        self.secret = resolve_secrets(self.settings.secret, credentials)
         if len(self.secret) < 32:
             raise ValueError("JWT secret must be at least 32 characters")
 
@@ -108,7 +108,7 @@ class JwtStrategy(AuthStrategy):
 class Authenticator:
     """Runs the strategy chain; enforces auth + scopes for an endpoint."""
 
-    def __init__(self, config: ProjectConfig):
+    def __init__(self, config: ProjectConfig, credentials=None):
         self.config = config
         self.strategies: list[AuthStrategy] = []
         self.jwt: JwtStrategy | None = None
@@ -116,7 +116,7 @@ class Authenticator:
             if method == "api_key":
                 self.strategies.append(ApiKeyStrategy(config))
             elif method == "jwt":
-                self.jwt = JwtStrategy(config)
+                self.jwt = JwtStrategy(config, credentials)
                 self.strategies.append(self.jwt)
 
     def identify(self, request: Request) -> Principal | None:

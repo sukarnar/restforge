@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 import secrets
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -12,6 +13,7 @@ import yaml
 
 from .config import (DEFAULT_CONFIG, ApiKeyRecord, ConfigError, EndpointSpec, ParamSpec,
                      ProjectConfig, SourceSpec, UserRecord)
+from .credentials import TYPES, Credential, CredentialError, CredentialManager, generate_master_key
 from .security.hashing import generate_api_key, hash_api_key, hash_password
 
 app = typer.Typer(help="restforge – declarative, secure REST endpoints for any data source.",
@@ -20,6 +22,9 @@ source_app = typer.Typer(help="Manage data sources.", no_args_is_help=True)
 endpoint_app = typer.Typer(help="Manage REST endpoints.", no_args_is_help=True)
 key_app = typer.Typer(help="Manage API keys.", no_args_is_help=True)
 user_app = typer.Typer(help="Manage users (for JWT login).", no_args_is_help=True)
+cred_app = typer.Typer(help="Manage connection credentials (DB logins, API tokens, OAuth clients…).",
+                       no_args_is_help=True)
+app.add_typer(cred_app, name="cred")
 app.add_typer(source_app, name="source")
 app.add_typer(endpoint_app, name="endpoint")
 app.add_typer(key_app, name="key")
@@ -86,18 +91,20 @@ def init(name: str = typer.Option("restforge-project", help="Project name."),
     ProjectConfig(project=name).save(cfg_path)
     env = directory / ".env"
     if not env.exists():
-        env.write_text(f"# Secrets – never commit this file\nRESTFORGE_JWT_SECRET={secrets.token_urlsafe(48)}\n",
-                       encoding="utf-8")
+        env.write_text("# Secrets – never commit this file\n"
+                       f"RESTFORGE_JWT_SECRET={secrets.token_urlsafe(48)}\n"
+                       f"RESTFORGE_MASTER_KEY={generate_master_key()}\n", encoding="utf-8")
         try:
             os.chmod(env, 0o600)
         except OSError:
             pass
     gi = directory / ".gitignore"
     if not gi.exists():
-        gi.write_text(".env\nlogs/\n__pycache__/\n", encoding="utf-8")
+        gi.write_text(".env\nlogs/\n__pycache__/\n.restforge/\n", encoding="utf-8")
     for d in ("data", "handlers", "logs"):
         (directory / d).mkdir(exist_ok=True)
     _ok(f"Initialised project '{name}' in {directory.resolve()}")
+    typer.echo("Credential vault ready (master key in .env). Add logins with: restforge cred add …")
     typer.echo("Next: restforge source add …  →  restforge endpoint add …  →  restforge key create …  →  restforge serve")
 
 
@@ -114,6 +121,9 @@ def source_add(
     module: Optional[str] = typer.Option(None, help="Default module for callable targets."),
     read_write: bool = typer.Option(False, "--read-write", help="Allow writes on a SQL source."),
     allow_host: bool = typer.Option(False, "--allow-host", help="Add the REST host to the allow-list."),
+    credential: Optional[str] = typer.Option(None, "--credential", help="Managed credential for connecting/auth."),
+    allow_credential: list[str] = typer.Option([], "--allow-credential",
+                                               help="Callable only: credential the handler may read (repeatable)."),
     description: str = "",
     config: str = CONFIG_OPT,
 ):
@@ -122,11 +132,12 @@ def source_add(
     if name in cfg.sources:
         typer.secho(f"✗ source '{name}' already exists", fg="red", err=True)
         raise typer.Exit(1)
-    if url and "://" in url and "@" in url and "${ENV:" not in url:
-        typer.secho("⚠ The URL appears to contain inline credentials. Prefer ${ENV:DB_URL}.", fg="yellow")
+    if url and "://" in url and "@" in url and "${" not in url:
+        typer.secho("⚠ The URL appears to contain inline credentials. Use --credential instead.", fg="yellow")
     try:
         spec = SourceSpec(type=type, url=url, path=path, sheet=sheet, base_url=base_url,
                           headers=_kv(header), module=module, read_only=not read_write,
+                          credential=credential, credentials=allow_credential,
                           description=description)
     except Exception as exc:
         typer.secho(f"✗ {exc}", fg="red", err=True)
@@ -145,11 +156,25 @@ def source_add(
     _ok(f"Source '{name}' ({type}) added")
 
 
+@source_app.command("set-credential")
+def source_set_credential(name: str, credential: Optional[str] = typer.Argument(None, help="Omit to unset."),
+                          config: str = CONFIG_OPT):
+    """Attach (or detach) a managed credential to an existing source."""
+    cfg = _load(config)
+    if name not in cfg.sources:
+        raise typer.BadParameter(f"no source '{name}'")
+    cfg.sources[name].credential = credential
+    _save(cfg, config)
+    _ok(f"Source '{name}' now uses credential {credential!r}")
+
+
 @source_app.command("list")
 def source_list(config: str = CONFIG_OPT):
     cfg = _load(config)
     for name, s in cfg.sources.items():
         detail = s.url or s.path or s.base_url or s.module or ""
+        if s.credential:
+            detail += f" (credential: {s.credential})"
         ro = " [read-only]" if s.type == "sql" and s.read_only else ""
         typer.echo(f"{name:<20} {s.type:<9} {detail}{ro}")
 
@@ -340,6 +365,283 @@ def key_revoke(key_id: str, config: str = CONFIG_OPT):
             _ok(f"Key {key_id} revoked (restart/reload the server to apply)")
             return
     raise typer.BadParameter(f"no key '{key_id}'")
+
+
+# ------------------------------------------------------------- credentials
+def _manager(config: str) -> tuple[ProjectConfig, CredentialManager]:
+    cfg_path = Path(config).resolve()
+    load_dotenv(cfg_path.parent / ".env")
+    cfg = _load(config)
+    try:
+        return cfg, CredentialManager.from_settings(cfg.security.credentials, cfg_path.parent)
+    except CredentialError as exc:
+        typer.secho(f"✗ {exc}", fg="red", err=True)
+        raise typer.Exit(1)
+
+
+def _fail(exc: Exception) -> None:
+    typer.secho(f"✗ {exc}", fg="red", err=True)
+    raise typer.Exit(1)
+
+
+def _set_env_line(env: Path, key: str, value: str) -> None:
+    lines = env.read_text(encoding="utf-8").splitlines() if env.exists() else []
+    lines = [l for l in lines if not l.startswith(f"{key}=")] + [f"{key}={value}"]
+    env.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    try:
+        os.chmod(env, 0o600)
+    except OSError:
+        pass
+
+
+def _collect_fields(ctype: str, field: list[str], secret_from_env: list[str],
+                    existing: dict | None = None, prompt_all_secrets: bool = True) -> dict:
+    fields = dict(existing or {})
+    fields.update(_kv(field))
+    for k, var in _kv(secret_from_env).items():          # non-interactive (CI) secrets
+        if var not in os.environ:
+            raise typer.BadParameter(f"environment variable '{var}' is not set")
+        fields[k] = os.environ[var]
+    t = TYPES[ctype]
+    cli_secrets = set(_kv(field)) & set(t.secret)
+    if cli_secrets:
+        typer.secho(f"⚠ secret field(s) {sorted(cli_secrets)} passed on the command line may be kept in "
+                    "shell history; omit them to be prompted instead.", fg="yellow")
+    for k in sorted(t.secret):
+        provided = k in _kv(field) or k in _kv(secret_from_env)
+        if not provided and (prompt_all_secrets or k not in fields):
+            if ctype == "database" and k == "password" and str(fields.get("driver", "")).startswith("sqlite"):
+                continue
+            fields[k] = typer.prompt(f"{k}", hide_input=True, confirmation_prompt=True)
+    for k in sorted(t.required - set(fields)):
+        fields[k] = typer.prompt(k)
+    return fields
+
+
+@cred_app.command("init")
+def cred_init(passphrase: bool = typer.Option(False, "--passphrase",
+                                              help="Use a passphrase you keep yourself instead of a generated key."),
+              config: str = CONFIG_OPT):
+    """Create the vault master key (stored in .env, never in the vault or YAML)."""
+    cfg_path = Path(config).resolve()
+    cfg = _load(config)
+    env_name = cfg.security.credentials.master_key_env
+    load_dotenv(cfg_path.parent / ".env")
+    if os.environ.get(env_name):
+        typer.secho(f"✗ {env_name} is already set – use 'restforge cred rekey' to change it", fg="red", err=True)
+        raise typer.Exit(1)
+    if passphrase:
+        typer.prompt("Master passphrase (min 16 chars)", hide_input=True, confirmation_prompt=True)
+        typer.echo(f"Not stored. Set {env_name} to this passphrase in the server's environment "
+                   "(e.g. a service/secret manager variable).")
+        return
+    _set_env_line(cfg_path.parent / ".env", env_name, generate_master_key())
+    _ok(f"Master key generated and written to .env as {env_name}")
+    typer.echo("Back it up somewhere safe (password manager). Without it the vault cannot be decrypted.")
+
+
+@cred_app.command("types")
+def cred_types():
+    """Show credential types and their fields."""
+    for t in TYPES.values():
+        typer.secho(t.name, bold=True)
+        typer.echo(f"  {t.description}")
+        if t.required:
+            typer.echo(f"  required: {', '.join(sorted(t.required))}")
+        if t.optional:
+            typer.echo(f"  optional: {', '.join(sorted(t.optional))}")
+        if t.secret:
+            typer.echo(f"  secret  : {', '.join(sorted(t.secret))}  (prompted, hidden)")
+
+
+@cred_app.command("add")
+def cred_add(
+    name: str,
+    type: str = typer.Option(..., "--type", "-t", help="database | basic | bearer | api_key | oauth2 | generic"),
+    field: list[str] = typer.Option([], "--field", "-f", help="Non-secret field KEY=VALUE (repeatable)."),
+    secret: list[str] = typer.Option([], "--secret", help="generic: name of a secret field (prompted)."),
+    secret_from_env: list[str] = typer.Option([], "--secret-from-env",
+                                              help="FIELD=ENV_VAR – read a secret from the environment (CI)."),
+    expires_days: Optional[int] = typer.Option(None, help="Mark for rotation after N days."),
+    provider: Optional[str] = typer.Option(None, help="Writable provider: vault | keyring | hashicorp."),
+    description: str = "",
+    config: str = CONFIG_OPT,
+):
+    """Store a credential. Secret fields are prompted with hidden input."""
+    if type not in TYPES:
+        raise typer.BadParameter(f"type must be one of {', '.join(TYPES)}")
+    if not re.match(r"^[a-zA-Z][a-zA-Z0-9_\-]{0,63}$", name):
+        raise typer.BadParameter("name: letters, digits, '_' or '-' (max 64)")
+    cfg, mgr = _manager(config)
+    try:
+        if any(c.name == name for c in mgr.list()):
+            raise CredentialError(f"credential '{name}' exists – use 'restforge cred rotate'")
+        fields = _collect_fields(type, field, secret_from_env)
+        for k in secret:
+            fields[k] = typer.prompt(k, hide_input=True, confirmation_prompt=True)
+        expires = ((datetime.now(timezone.utc) + timedelta(days=expires_days)).isoformat(timespec="seconds")
+                   if expires_days else None)
+        where = mgr.put(Credential(name=name, type=type, fields=fields, description=description,
+                                   expires=expires, secret_fields=secret), provider)
+    except (CredentialError, ValueError) as exc:
+        _fail(exc)
+    _ok(f"Credential '{name}' ({type}) stored in {where}")
+    typer.echo(f"Use it:  restforge source add <name> --type ... --credential {name}   "
+               f"or  ${{CRED:{name}.<field>}}")
+
+
+@cred_app.command("list")
+def cred_list(config: str = CONFIG_OPT):
+    """List credentials (metadata only – never secrets)."""
+    cfg, mgr = _manager(config)
+    users = _credential_users(cfg)
+    try:
+        creds = mgr.list()
+    except CredentialError as exc:
+        _fail(exc)
+    if not creds:
+        typer.echo("No credentials yet. Add one with 'restforge cred add'.")
+    now = datetime.now(timezone.utc)
+    for c in creds:
+        state = ""
+        if c.expires:
+            days = (datetime.fromisoformat(c.expires) - now).days
+            state = "EXPIRED" if days < 0 else f"expires in {days}d"
+        typer.echo(f"{c.name:<20} {c.type:<9} {c.provider:<9} {state:<16} "
+                   f"fields={','.join(sorted(c.fields))}  used-by={','.join(users.get(c.name, [])) or '-'}")
+
+
+@cred_app.command("show")
+def cred_show(name: str, reveal: bool = typer.Option(False, "--reveal", help="Print secret values."),
+              config: str = CONFIG_OPT):
+    """Show one credential (secrets masked unless --reveal)."""
+    cfg, mgr = _manager(config)
+    try:
+        c = mgr.get(name)
+    except CredentialError as exc:
+        _fail(exc)
+    if reveal and not typer.confirm(f"Print secret values of '{name}' to the terminal?"):
+        raise typer.Exit(1)
+    typer.echo(yaml.safe_dump({"name": c.name, "type": c.type, "provider": c.provider,
+                               "description": c.description, "created": c.created, "updated": c.updated,
+                               "expires": c.expires, "fields": c.fields if reveal else c.masked()},
+                              sort_keys=False))
+
+
+@cred_app.command("rotate")
+def cred_rotate(name: str,
+                field: list[str] = typer.Option([], "--field", "-f", help="Change a non-secret field KEY=VALUE."),
+                secret_from_env: list[str] = typer.Option([], "--secret-from-env"),
+                keep_secrets: bool = typer.Option(False, help="Only change the given --field values."),
+                expires_days: Optional[int] = None,
+                config: str = CONFIG_OPT):
+    """Replace a credential's secret(s). Running servers pick it up within cache_ttl_seconds
+    and rebuild their connection pools – no restart needed."""
+    cfg, mgr = _manager(config)
+    try:
+        c = mgr.get(name)
+        c.fields = _collect_fields(c.type, field, secret_from_env, existing=c.fields,
+                                   prompt_all_secrets=not keep_secrets)
+        for k in c.secret_fields:
+            if not keep_secrets:
+                c.fields[k] = typer.prompt(k, hide_input=True, confirmation_prompt=True)
+        if expires_days:
+            c.expires = (datetime.now(timezone.utc) + timedelta(days=expires_days)).isoformat(timespec="seconds")
+        provider = c.provider if c.provider != "env" else None
+        mgr.put(c, provider)
+    except (CredentialError, ValueError) as exc:
+        _fail(exc)
+    _ok(f"Credential '{name}' rotated")
+
+
+@cred_app.command("remove")
+def cred_remove(name: str, force: bool = typer.Option(False, "--force"), config: str = CONFIG_OPT):
+    """Delete a credential (refuses while sources still use it, unless --force)."""
+    cfg, mgr = _manager(config)
+    users = _credential_users(cfg).get(name)
+    if users and not force:
+        _fail(CredentialError(f"credential '{name}' is used by {users}; detach first or use --force"))
+    try:
+        if not mgr.delete(name):
+            _fail(CredentialError(f"no credential '{name}'"))
+    except CredentialError as exc:
+        _fail(exc)
+    _ok(f"Credential '{name}' removed")
+
+
+@cred_app.command("test")
+def cred_test(name: str, url: Optional[str] = typer.Option(None, help="HTTP types: URL to GET with the auth."),
+              config: str = CONFIG_OPT):
+    """Check that a credential works (DB login, OAuth token fetch, or an authenticated GET)."""
+    import httpx
+    from sqlalchemy import create_engine, literal, select
+    from .credentials import build_http_auth, build_sql_url
+
+    cfg, mgr = _manager(config)
+    try:
+        c = mgr.get(name)
+        if c.type == "database":
+            eng = create_engine(build_sql_url(c))
+            with eng.connect() as conn:
+                conn.execute(select(literal(1)))
+            eng.dispose()
+            _ok(f"Connected to database with '{name}'")
+        elif c.type == "generic":
+            _ok(f"'{name}' decrypted OK ({len(c.fields)} fields)")
+        else:
+            auth, headers, params = build_http_auth(c, cfg.security.allowed_upstream_hosts)
+            if c.type == "oauth2" and not url:
+                with httpx.Client(timeout=10) as client:
+                    flow = auth.auth_flow(httpx.Request("GET", "https://placeholder.invalid/"))
+                    auth._store(client.send(next(flow)))
+                _ok(f"OAuth token obtained for '{name}'")
+            elif url:
+                with httpx.Client(timeout=10, auth=auth, headers=headers, follow_redirects=False) as client:
+                    r = client.get(url, params=params)
+                (_ok if r.status_code < 400 else _fail_soft)(f"GET {url} -> HTTP {r.status_code}")
+            else:
+                _ok(f"'{name}' is valid; pass --url to test it against an endpoint")
+    except Exception as exc:
+        _fail(Exception(mgr.redact(f"{type(exc).__name__}: {exc}")))
+
+
+def _fail_soft(msg: str) -> None:
+    typer.secho(f"✗ {msg}", fg="red", err=True)
+    raise typer.Exit(1)
+
+
+@cred_app.command("rekey")
+def cred_rekey(passphrase: bool = typer.Option(False, "--passphrase"), config: str = CONFIG_OPT):
+    """Re-encrypt the vault under a new master key (key rotation)."""
+    cfg, mgr = _manager(config)
+    vault = next((p for p in mgr.providers if p.name == "vault"), None)
+    if vault is None:
+        _fail(CredentialError("the 'vault' provider is not enabled"))
+    new = (typer.prompt("New master passphrase", hide_input=True, confirmation_prompt=True)
+           if passphrase else generate_master_key())
+    try:
+        n = vault.rekey(new)
+    except CredentialError as exc:
+        _fail(exc)
+    if not passphrase:
+        _set_env_line(Path(config).resolve().parent / ".env", cfg.security.credentials.master_key_env, new)
+        _ok(f"Re-encrypted {n} credential(s); new key written to .env")
+    else:
+        _ok(f"Re-encrypted {n} credential(s); update {cfg.security.credentials.master_key_env} on the server")
+    typer.echo("Restart running servers so they use the new master key.")
+
+
+def _credential_users(cfg: ProjectConfig) -> dict[str, list[str]]:
+    from .config import credential_refs
+    users: dict[str, list[str]] = {}
+    for sname, s in cfg.sources.items():
+        names = ({s.credential} if s.credential else set()) | set(s.credentials) | \
+            credential_refs(s.url) | credential_refs(s.headers)
+        for n in names:
+            users.setdefault(n, []).append(f"source:{sname}")
+    for n in credential_refs(cfg.security.jwt.secret):
+        users.setdefault(n, []).append("jwt")
+    return users
 
 
 # ------------------------------------------------------------------ users
