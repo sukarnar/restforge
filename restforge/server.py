@@ -8,6 +8,8 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.openapi.docs import get_swagger_ui_html
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import sources as _sources  # noqa: F401 (registers built-in adapters)
@@ -91,7 +93,7 @@ def create_app(config: ProjectConfig | str | Path = DEFAULT_CONFIG,
     docs = sec.expose_docs
     app = FastAPI(
         title=config.project, version=config.version, lifespan=lifespan,
-        docs_url=f"{base}/docs" if docs else None, redoc_url=None,
+        docs_url=None, redoc_url=None,          # served below from bundled assets (works offline)
         openapi_url=f"{base}/openapi.json" if docs else None,
     )
     app.state.config = config
@@ -107,7 +109,20 @@ def create_app(config: ProjectConfig | str | Path = DEFAULT_CONFIG,
                            allow_headers=["Authorization", "Content-Type", sec.api_key_header])
     app.add_middleware(SecurityMiddleware, max_body_bytes=sec.max_body_bytes,
                        hsts=bool(config.server.ssl_certfile),
-                       docs_paths=(f"{base}/docs", f"{base}/openapi.json") if docs else ())
+                       docs_paths=(f"{base}/docs", f"{base}/openapi.json", f"{base}/_static") if docs else ())
+
+    if docs:
+        # Swagger UI assets ship inside the package: no CDN, so /docs works on air-gapped servers.
+        app.mount(f"{base}/_static", StaticFiles(directory=str(Path(__file__).parent / "static")),
+                  name="restforge-static")
+
+        @app.get(f"{base}/docs", include_in_schema=False)
+        async def swagger_ui():
+            return get_swagger_ui_html(
+                openapi_url=f"{base}/openapi.json", title=f"{config.project} – API docs",
+                swagger_js_url=f"{base}/_static/swagger/swagger-ui-bundle.js",
+                swagger_css_url=f"{base}/_static/swagger/swagger-ui.css",
+                swagger_favicon_url=f"{base}/_static/swagger/favicon-32x32.png")
 
     # ----------------------------------------------------- system routes
     @app.get("/health", include_in_schema=False)

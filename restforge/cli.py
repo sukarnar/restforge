@@ -687,6 +687,107 @@ def validate(config: str = CONFIG_OPT):
 
 
 @app.command()
+def call(
+    endpoint: str = typer.Argument(..., help="Endpoint name (see 'restforge endpoint list')."),
+    param: list[str] = typer.Option([], "--param", "-p", help="NAME=VALUE (repeatable): path, query or body param."),
+    body: Optional[str] = typer.Option(None, "--body", help="Raw JSON object for the request body (or @file.json)."),
+    limit: Optional[int] = typer.Option(None, help="Page size for list endpoints."),
+    offset: Optional[int] = typer.Option(None, help="Rows to skip for list endpoints."),
+    table: bool = typer.Option(False, "--table", help="Print 'items' as a table instead of JSON."),
+    output: Optional[Path] = typer.Option(None, "--output", "-o", help="Write the JSON result to a file."),
+    quiet: bool = typer.Option(False, "--quiet", "-q", help="No output; exit code only."),
+    config: str = CONFIG_OPT,
+):
+    """Run an endpoint in-process – no server needed. Exit code 0 on success, 1 on error.
+
+    Runs with full (admin) rights because whoever can read this project's .env and
+    vault already controls it; params are still validated and the call is audited.
+    """
+    import getpass
+    import json as _json
+    from urllib.parse import quote, urlencode
+
+    from fastapi.testclient import TestClient
+
+    cfg_path = Path(config).resolve()
+    load_dotenv(cfg_path.parent / ".env")
+    cfg = _load(str(cfg_path))
+    ep = cfg.endpoint(endpoint)
+    if ep is None:
+        _fail(Exception(f"no endpoint '{endpoint}' – see 'restforge endpoint list'"))
+
+    # Map NAME=VALUE onto the endpoint's declared params
+    values = _kv(param)
+    where = {p.name: p.location for p in ep.params}
+    unknown = sorted(set(values) - set(where))
+    if unknown:
+        _fail(Exception(f"unknown param(s) {unknown}; '{endpoint}' accepts {sorted(where) or 'none'}"))
+    path = ep.path
+    for n, loc in where.items():
+        if loc == "path":
+            if n not in values:
+                _fail(Exception(f"missing path param '{n}' (use -p {n}=VALUE)"))
+            path = path.replace("{" + n + "}", quote(values[n], safe=""))
+    query = {n: v for n, v in values.items() if where[n] == "query"}
+    if limit is not None:
+        query["limit"] = limit
+    if offset is not None:
+        query["offset"] = offset
+    json_body = {n: v for n, v in values.items() if where[n] == "body"}
+    if body:
+        raw = Path(body[1:]).read_text(encoding="utf-8") if body.startswith("@") else body
+        try:
+            json_body.update(_json.loads(raw))
+        except Exception as exc:
+            _fail(Exception(f"--body is not valid JSON: {exc}"))
+
+    # In-memory, single-use admin key (never saved) so the call takes the normal pipeline
+    key_id, key = generate_api_key()
+    cfg.security.api_keys.append(ApiKeyRecord(
+        id=key_id, name=f"cli:{getpass.getuser()}", hash=hash_api_key(key), scopes=["*"],
+        created=datetime.now(timezone.utc).isoformat()))
+    if "api_key" not in cfg.security.auth_methods:
+        cfg.security.auth_methods.append("api_key")
+
+    from .server import create_app
+    try:
+        app = create_app(cfg, project_root=cfg_path.parent)
+    except Exception as exc:
+        _fail(exc)
+    url = cfg.server.base_path.rstrip("/") + path + (("?" + urlencode(query)) if query else "")
+    with TestClient(app, raise_server_exceptions=False) as client:
+        resp = client.request(ep.method, url, headers={cfg.security.api_key_header: key},
+                              json=json_body if json_body else None)
+    try:
+        data = resp.json()
+    except Exception:
+        data = {"content": resp.text}
+    ok = resp.status_code < 400
+
+    if output:
+        output.write_text(_json.dumps(data, indent=2, default=str), encoding="utf-8")
+    if not quiet:
+        if not ok:
+            typer.secho(f"✗ HTTP {resp.status_code}", fg="red", err=True)
+            typer.echo(_json.dumps(data, indent=2, default=str), err=True)
+        elif table and isinstance(data, dict) and isinstance(data.get("items"), list):
+            rows = data["items"]
+            if rows:
+                cols = list(rows[0].keys())
+                widths = {c: max(len(str(c)), *(len(str(r.get(c, ""))) for r in rows)) for c in cols}
+                typer.echo("  ".join(str(c).ljust(widths[c]) for c in cols))
+                typer.echo("  ".join("-" * widths[c] for c in cols))
+                for r in rows:
+                    typer.echo("  ".join(str(r.get(c, "")).ljust(widths[c]) for c in cols))
+            typer.echo(f"({len(rows)} rows)")
+        elif not output:
+            typer.echo(_json.dumps(data, indent=2, default=str))
+        else:
+            _ok(f"HTTP {resp.status_code} – result written to {output}")
+    raise typer.Exit(0 if ok else 1)
+
+
+@app.command()
 def serve(config: str = CONFIG_OPT,
           host: Optional[str] = typer.Option(None, help="Default from config (127.0.0.1)."),
           port: Optional[int] = None,

@@ -15,10 +15,10 @@ SECURITY_HEADERS = [
     (b"content-security-policy", b"default-src 'none'; frame-ancestors 'none'"),
     (b"permissions-policy", b"geolocation=(), camera=(), microphone=()"),
 ]
-# Swagger UI needs to load its assets, so docs pages get a relaxed CSP.
+# Swagger UI (bundled locally) needs scripts/styles from this origin and one inline bootstrap script.
 DOCS_CSP = (b"content-security-policy",
-            b"default-src 'self'; script-src 'self' 'unsafe-inline' cdn.jsdelivr.net; "
-            b"style-src 'self' 'unsafe-inline' cdn.jsdelivr.net; img-src 'self' data: fastapi.tiangolo.com")
+            b"default-src 'self'; script-src 'self' 'unsafe-inline'; "
+            b"style-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'")
 
 
 async def _send_json(send, status: int, body: dict, headers: list | None = None) -> None:

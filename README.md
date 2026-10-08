@@ -112,9 +112,22 @@ Non-interactive (CI): `restforge cred add db -t database ... --secret-from-env p
 | `cred init/types/add/list/show/rotate/test/rekey/remove` | Connection credentials (see above) |
 | `source set-credential SOURCE [CRED]` | Attach/detach a credential on an existing source |
 | `validate` | Full build of the app without serving – use in CI |
+| `call ENDPOINT [-p NAME=VALUE]… [--body JSON] [--table] [-o FILE]` | Run an endpoint directly, no server (scripts, schedulers); exit code 0/1 |
 | `serve [--reload] [--workers]` | Run with uvicorn |
 
 All commands accept `-c/--config` to point at another project file.
+
+## Running endpoints without a server
+```bash
+restforge call employees-list -p department_id=50 --limit 20 --table
+restforge call employees-get -p employee_id=101
+restforge call employees-create -p first_name=Dev -p last_name=Rao
+restforge call employees-update -p employee_id=101 --body '{"department_id": 60}'
+restforge call dept-headcount -o headcount.json -q      # write result to a file, exit code only
+```
+`call` runs the same pipeline as the server (validation, data access, audit log) inside the CLI process.
+It runs with admin rights – anyone who can read the project's `.env` and vault already has them – and
+exits with 0 on success and 1 on any error, so schedulers can check the result.
 
 ## Custom functions
 ```python

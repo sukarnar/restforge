@@ -9,7 +9,7 @@ description = "Declarative, secure REST API builder for SQL databases, files, up
 requires-python = ">=3.11"
 dependencies = [
   "fastapi>=0.110",
-  "uvicorn[standard]>=0.29",
+  "uvicorn>=0.29",
   "typer>=0.12",
   "pydantic>=2.6",
   "pyyaml>=6",
@@ -23,6 +23,7 @@ dependencies = [
 [project.optional-dependencies]
 postgres = ["psycopg[binary]>=3.1"]
 mysql = ["pymysql>=1.1"]
+mssql = ["pyodbc>=5"]
 oracle = ["oracledb>=2.0"]
 keyring = ["keyring>=25"]   # Windows Credential Manager / macOS Keychain
 dev = ["pytest>=8"]
@@ -32,3 +33,6 @@ restforge = "restforge.cli:app"
 
 [tool.setuptools.packages.find]
 include = ["restforge*"]
+
+[tool.setuptools.package-data]
+restforge = ["static/swagger/*"]
