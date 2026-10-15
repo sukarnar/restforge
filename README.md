@@ -112,6 +112,7 @@ Non-interactive (CI): `restforge cred add db -t database ... --secret-from-env p
 | `cred init/types/add/list/show/rotate/test/rekey/remove` | Connection credentials (see above) |
 | `source set-credential SOURCE [CRED]` | Attach/detach a credential on an existing source |
 | `validate` | Full build of the app without serving – use in CI |
+| `load create/map/show/list/validate/run/history/remove` | Load jobs: CSV/endpoint → mapped columns → database table |
 | `call ENDPOINT [-p NAME=VALUE]… [--body JSON] [--table] [-o FILE]` | Run an endpoint directly, no server (scripts, schedulers); exit code 0/1 |
 | `serve [--reload] [--workers]` | Run with uvicorn |
 
@@ -128,6 +129,43 @@ restforge call dept-headcount -o headcount.json -q      # write result to a file
 `call` runs the same pipeline as the server (validation, data access, audit log) inside the CLI process.
 It runs with admin rights – anyone who can read the project's `.env` and vault already has them – and
 exits with 0 on success and 1 on any error, so schedulers can check the result.
+
+## Loading data into a database table (load jobs)
+A load job reads rows from a file source (CSV/JSON/Excel) or any GET endpoint (all pages), maps each
+source column to a target column, validates every row and writes to a table in ONE transaction.
+
+```powershell
+# target source must allow writes
+restforge source add hr_rw -t sql --credential hr_oracle --read-write
+
+# 1. create (auto-map suggests matches from the CSV header and the table; guesses are flagged REVIEW)
+restforge load create transfers-to-db --from-endpoint transfer-list --to hr_rw --table hr.emp_transfers --auto-map
+
+# 2. map source -> target where names differ  ("Source=target[:type[:format]]")
+restforge load map transfers-to-db --set "Emp No=employee_id:integer" --set "Eff Date=effective_dt:date:%m/%d/%Y" `
+  --set "Dept=dept_code" --transform "dept_code=trim,upper" --default "amount_usd=0" --required employee_id `
+  --value "load_source=CSV" --value 'loaded_at=${now}' --mode upsert --key transfer_id
+
+# 3. check, preview, run
+restforge load validate transfers-to-db                 # vs CSV header + real table (NOT NULL, lengths, keys)
+restforge load run transfers-to-db --dry-run --preview 3
+restforge load run transfers-to-db                      # exit 0 = ok, 2 = loaded with rejects, 1 = failed/rolled back
+restforge load history transfers-to-db
+```
+
+| Setting | Values |
+|---|---|
+| `mode` | `insert` (append) · `replace` (DELETE + INSERT in one transaction) · `upsert` on `keys` (Oracle/SQL Server `MERGE`, Postgres/SQLite `ON CONFLICT`, MySQL `ON DUPLICATE KEY`) |
+| column `type` | `string`, `integer`, `number`, `boolean`, `date`, `timestamp` (+ `format`, e.g. `%m/%d/%Y`) |
+| `transform` | `trim`, `upper`, `lower`, `null_if_empty`, `{replace: [old, new]}`, `{lookup: {A: Active, _default: Other}}` |
+| `value` | constant, `${now}`, `${today}`, `${run_id}` |
+| `max_rejects` | bad rows allowed before the whole load is refused (default 0). Rejects go to `logs\loads\<run>_rejects.csv` with the reason |
+| `unmapped_source_columns` | `ignore` (default) or `error` |
+
+Over REST: `POST /api/_loads/{name}/run[?dry_run=true]` and `GET /api/_loads` (scope `load:run`).
+Validation blocks a run when a mapped column is missing on either side, a NOT NULL column without a
+default is unmapped, an auto-map guess is unconfirmed, or upsert keys are not a primary/unique key.
+Text longer than the column allows becomes a reject instead of a database error.
 
 ## Custom functions
 ```python

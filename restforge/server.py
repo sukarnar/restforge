@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.staticfiles import StaticFiles
@@ -147,6 +148,31 @@ def create_app(config: ProjectConfig | str | Path = DEFAULT_CONFIG,
         return [{"name": c.name, "type": c.type, "provider": c.provider, "expires": c.expires,
                  "updated": c.updated, "used_by": sorted(credentials.usage.get(c.name, set()) - {"startup-check"})}
                 for c in credentials.list()]
+
+    # ------------------------------------------------------- load jobs
+    from .loads import LoadRunner
+    load_runner = LoadRunner(config, data_sources, project_root, audit)
+
+    @app.get(f"{base}/_loads", tags=["loads"])
+    async def list_loads(request: Request):
+        authenticator.require(request, ["load:run"], public=False)
+        return [{"name": l.name, "from": l.from_.endpoint or l.from_.source,
+                 "to": f"{l.to.source}.{l.to.table}", "mode": l.mode, "columns": len(l.columns)}
+                for l in config.loads]
+
+    @app.post(f"{base}/_loads/{{name}}/run", tags=["loads"])
+    async def run_load(name: str, request: Request, dry_run: bool = False):
+        """Run a load job. 200 = success/partial/dry_run (see 'status'), 422 = failed and rolled back."""
+        authenticator.require(request, ["load:run"], public=False)
+        spec = config.load_job(name)
+        if spec is None:
+            raise HTTPException(404, f"No load '{name}'")
+        rep = await load_runner.run(spec, dry_run=dry_run)
+        body = rep.to_dict()
+        body.pop("preview", None)
+        if body.get("rejects_file"):
+            body["rejects_file"] = Path(body["rejects_file"]).name     # don't reveal server paths
+        return JSONResponse(body, status_code=422 if rep.status == "failed" else 200)
 
     if "jwt" in sec.auth_methods:
         @app.post(f"{base}/auth/token", tags=["auth"])

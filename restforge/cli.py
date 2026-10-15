@@ -11,6 +11,7 @@ from typing import Optional
 import typer
 import yaml
 
+from .config import ColumnMap as ColumnMapModel
 from .config import (DEFAULT_CONFIG, ApiKeyRecord, ConfigError, EndpointSpec, ParamSpec,
                      ProjectConfig, SourceSpec, UserRecord)
 from .credentials import TYPES, Credential, CredentialError, CredentialManager, generate_master_key
@@ -642,6 +643,323 @@ def _credential_users(cfg: ProjectConfig) -> dict[str, list[str]]:
     for n in credential_refs(cfg.security.jwt.secret):
         users.setdefault(n, []).append("jwt")
     return users
+
+
+# ------------------------------------------------------------------ loads
+load_app = typer.Typer(help="Load data from a CSV/file source or endpoint into a database table, "
+                            "with source-to-target column mapping.", no_args_is_help=True)
+app.add_typer(load_app, name="load")
+
+
+def _load_ctx(config: str):
+    cfg_path = Path(config).resolve()
+    load_dotenv(cfg_path.parent / ".env")
+    return cfg_path, _load(str(cfg_path))
+
+
+def _get_load(cfg: ProjectConfig, name: str):
+    spec = cfg.load_job(name)
+    if spec is None:
+        _fail(Exception(f"no load '{name}' – see 'restforge load list'"))
+    return spec
+
+
+def _print_mapping(spec) -> None:
+    rows = []
+    for c in spec.columns:
+        src = c.source if c.source is not None else f"= {c.value!r}"
+        extra = []
+        if c.format:
+            extra.append(c.format)
+        if c.transform:
+            extra.append("transform=" + ",".join(t if isinstance(t, str) else next(iter(t)) for t in c.transform))
+        if c.default is not None:
+            extra.append(f"default={c.default!r}")
+        if c.required:
+            extra.append("required")
+        if c.target.lower() in {k.lower() for k in spec.keys}:
+            extra.append("KEY")
+        if c.review:
+            extra.append("REVIEW")
+        rows.append((str(src), c.target, c.type, " ".join(extra)))
+    if not rows:
+        typer.echo("  (no columns mapped)")
+        return
+    w = [max(len(r[i]) for r in rows + [("SOURCE", "TARGET", "TYPE", "")]) for i in range(3)]
+    typer.echo(f"  {'SOURCE'.ljust(w[0])}  ->  {'TARGET'.ljust(w[1])}  {'TYPE'.ljust(w[2])}  NOTES")
+    for r in rows:
+        line = f"  {r[0].ljust(w[0])}  ->  {r[1].ljust(w[1])}  {r[2].ljust(w[2])}  {r[3]}"
+        typer.secho(line, fg="yellow" if "REVIEW" in r[3] else None)
+
+
+def _print_report(rep, as_json: bool) -> None:
+    import json as _json
+    if as_json:
+        typer.echo(_json.dumps(rep.to_dict(), indent=2, default=str))
+        return
+    color = {"success": "green", "dry_run": "cyan", "partial": "yellow", "failed": "red"}[rep.status]
+    typer.secho(f"{rep.status.upper()}  load={rep.load} run={rep.run_id} mode={rep.mode} ({rep.seconds}s)",
+                fg=color, bold=True)
+    typer.echo(f"  read={rep.read} mapped={rep.mapped} rejected={rep.rejected} "
+               f"inserted={rep.inserted} updated={rep.updated} upserted={rep.upserted} deleted={rep.deleted}")
+    for w in rep.warnings:
+        typer.secho(f"  ⚠ {w}", fg="yellow")
+    if rep.rejects_file:
+        typer.echo(f"  rejects: {rep.rejects_file}")
+    if rep.error:
+        typer.secho(f"  ✗ {rep.error}", fg="red", err=True)
+    for p in rep.preview:
+        typer.echo(f"  -- record {p['record']}")
+        typer.echo(f"     source: {p['source']}")
+        typer.echo(f"     target: { {k: str(v) for k, v in p['target'].items()} }")
+
+
+@load_app.command("create")
+def load_create(
+    name: str,
+    to: str = typer.Option(..., "--to", help="Target SQL source (must be --read-write)."),
+    table: str = typer.Option(..., "--table", help="Target table, e.g. hr.emp_transfers"),
+    from_endpoint: Optional[str] = typer.Option(None, "--from-endpoint", help="Read rows from this GET endpoint."),
+    from_source: Optional[str] = typer.Option(None, "--from-source", help="Read rows directly from this file source."),
+    mode: str = typer.Option("insert", help="insert | replace | upsert"),
+    key: list[str] = typer.Option([], "--key", help="Upsert key target column (repeatable)."),
+    auto_map_: bool = typer.Option(False, "--auto-map", help="Suggest a mapping from the CSV header and table."),
+    batch_size: int = 1000,
+    max_rejects: int = 0,
+    description: str = "",
+    config: str = CONFIG_OPT,
+):
+    """Create a load job (optionally with an auto-suggested column mapping)."""
+    import anyio
+    from .config import LoadSpec
+    from .loads import auto_map, column_type_name, runtime_for, sources_needed
+
+    cfg_path, cfg = _load_ctx(config)
+    if cfg.load_job(name):
+        _fail(Exception(f"load '{name}' exists – edit it with 'restforge load map'"))
+    try:
+        spec = LoadSpec.model_validate({
+            "name": name, "description": description, "mode": "insert", "batch_size": batch_size,
+            "max_rejects": max_rejects, "to": {"source": to, "table": table},
+            "from": {"endpoint": from_endpoint} if from_endpoint else {"source": from_source}})
+        cfg.loads.append(spec)
+        ProjectConfig.model_validate(cfg.model_dump(mode="json", by_alias=True))
+    except Exception as exc:
+        _fail(exc)
+
+    if auto_map_:
+        async def _suggest():
+            async with runtime_for(cfg, cfg_path.parent, sources_needed(cfg, spec)) as runner:
+                rows = await runner.read_rows(spec)
+                tgt = runner._target(spec)
+                tbl = await anyio.to_thread.run_sync(tgt._table, table)
+                return rows, {c.name: column_type_name(c) for c in tbl.columns}, tbl
+        try:
+            rows, target_cols, tbl = anyio.run(_suggest)
+        except Exception as exc:
+            _fail(exc)
+        if not rows:
+            _fail(Exception("source returned no rows – cannot read its column names"))
+        cols, unmatched = auto_map(list(rows[0].keys()), target_cols)
+        spec.columns = [ColumnMapModel.model_validate(c) for c in cols]
+        mapped = {c["target"] for c in cols}
+        missing_req = [c.name for c in tbl.columns if c.name not in mapped and not c.nullable
+                       and c.server_default is None]
+    spec.mode = mode
+    spec.keys = key
+    try:
+        cfg.loads[-1] = LoadSpec.model_validate(spec.model_dump(mode="json", by_alias=True))
+    except Exception as exc:
+        _fail(Exception(f"{exc}\nTip: create with the default mode first, map the key columns, "
+                        f"then set mode/keys in restforge.yaml"))
+    _save(cfg, str(cfg_path))
+    _ok(f"Load '{name}' created ({mode}: {from_endpoint or from_source} -> {to}.{table})")
+    if auto_map_:
+        _print_mapping(cfg.loads[-1])
+        if unmatched:
+            typer.secho(f"  ⚠ source columns with no matching target (ignored): {unmatched}", fg="yellow")
+        if missing_req:
+            typer.secho(f"  ⚠ required target columns not mapped: {missing_req}", fg="yellow")
+        if any(c.review for c in cfg.loads[-1].columns):
+            typer.secho("  Yellow rows are guesses – confirm each with: "
+                        f"restforge load map {name} --set \"<Source>=<target>\"", fg="yellow")
+    typer.echo(f"Next: restforge load validate {name}  →  restforge load run {name} --dry-run --preview 3")
+
+
+@load_app.command("map")
+def load_map(
+    name: str,
+    set_: list[str] = typer.Option([], "--set", help='"Source Col=target[:type[:format]]"  e.g. "Eff Date=eff_dt:date:%m/%d/%Y"'),
+    value: list[str] = typer.Option([], "--value", help='"target=constant" (also ${now}, ${today}, ${run_id})'),
+    transform: list[str] = typer.Option([], "--transform", help='"target=trim,upper,null_if_empty"'),
+    default: list[str] = typer.Option([], "--default", help='"target=value used when blank"'),
+    required: list[str] = typer.Option([], "--required", help="Target column that must have a value."),
+    remove: list[str] = typer.Option([], "--remove", help="Target column to unmap."),
+    mode: Optional[str] = typer.Option(None, help="insert | replace | upsert"),
+    key: list[str] = typer.Option([], "--key", help="Upsert key (replaces existing keys when given)."),
+    config: str = CONFIG_OPT,
+):
+    """Add or change column mappings of a load job."""
+    from .config import LoadSpec
+    cfg_path, cfg = _load_ctx(config)
+    spec = _get_load(cfg, name)
+    cols = {c.target.lower(): c.model_dump(exclude_none=True) for c in spec.columns}
+
+    def _col(target: str) -> dict:
+        if target.lower() not in cols:
+            _fail(Exception(f"target '{target}' is not mapped yet; map it first with --set or --value"))
+        return cols[target.lower()]
+
+    for item in set_:
+        if "=" not in item:
+            raise typer.BadParameter(f"--set expects \"Source=target[:type[:format]]\", got {item!r}")
+        src, rhs = item.split("=", 1)
+        parts = rhs.split(":", 2)
+        entry = cols.get(parts[0].lower(), {})
+        entry.update({"source": src.strip(), "target": parts[0].strip(), "review": False})
+        entry.pop("value", None)
+        if len(parts) > 1 and parts[1]:
+            entry["type"] = parts[1]
+        if len(parts) > 2:
+            entry["format"] = parts[2]
+        # one source column -> one target: drop other targets reading the same source with review flags
+        cols[parts[0].lower()] = entry
+    for item in value:
+        tgt, val = item.split("=", 1)
+        entry = cols.get(tgt.lower(), {"target": tgt})
+        entry.pop("source", None)
+        entry.update({"value": val, "review": False})
+        cols[tgt.lower()] = entry
+    for item in transform:
+        tgt, steps = item.split("=", 1)
+        _col(tgt)["transform"] = [s.strip() for s in steps.split(",") if s.strip()]
+    for item in default:
+        tgt, val = item.split("=", 1)
+        _col(tgt)["default"] = val
+    for tgt in required:
+        _col(tgt)["required"] = True
+    for tgt in remove:
+        if cols.pop(tgt.lower(), None) is None:
+            _fail(Exception(f"target '{tgt}' is not mapped"))
+    data = spec.model_dump(mode="json", by_alias=True, exclude_none=True)
+    data["columns"] = list(cols.values())
+    if mode:
+        data["mode"] = mode
+    if key:
+        data["keys"] = key
+    try:
+        new = LoadSpec.model_validate(data)
+    except Exception as exc:
+        _fail(exc)
+    cfg.loads = [new if l.name == name else l for l in cfg.loads]
+    _save(cfg, str(cfg_path))
+    _ok(f"Load '{name}' updated")
+    _print_mapping(new)
+
+
+@load_app.command("show")
+def load_show(name: str, yaml_: bool = typer.Option(False, "--yaml", help="Print the raw definition."),
+              config: str = CONFIG_OPT):
+    """Show a load job and its column mapping."""
+    _, cfg = _load_ctx(config)
+    spec = _get_load(cfg, name)
+    if yaml_:
+        typer.echo(yaml.safe_dump(spec.model_dump(mode="json", by_alias=True, exclude_none=True), sort_keys=False))
+        return
+    src = spec.from_.endpoint and f"endpoint {spec.from_.endpoint}" or f"source {spec.from_.source}"
+    typer.secho(f"{spec.name}: {src}  ->  {spec.to.source}.{spec.to.table}", bold=True)
+    typer.echo(f"  mode={spec.mode} keys={spec.keys or '-'} batch_size={spec.batch_size} "
+               f"max_rejects={spec.max_rejects} unmapped_source_columns={spec.unmapped_source_columns}")
+    _print_mapping(spec)
+
+
+@load_app.command("list")
+def load_list(config: str = CONFIG_OPT):
+    """List load jobs."""
+    _, cfg = _load_ctx(config)
+    if not cfg.loads:
+        typer.echo("No loads yet. Create one with 'restforge load create'.")
+    for l in cfg.loads:
+        src = l.from_.endpoint or l.from_.source
+        typer.echo(f"{l.name:<24} {src:<22} -> {l.to.source}.{l.to.table:<28} {l.mode:<8} {len(l.columns)} cols")
+
+
+@load_app.command("remove")
+def load_remove(name: str, config: str = CONFIG_OPT):
+    """Delete a load job definition (the table and its data are not touched)."""
+    cfg_path, cfg = _load_ctx(config)
+    _get_load(cfg, name)
+    cfg.loads = [l for l in cfg.loads if l.name != name]
+    _save(cfg, str(cfg_path))
+    _ok(f"Load '{name}' removed")
+
+
+@load_app.command("validate")
+def load_validate(name: str, config: str = CONFIG_OPT):
+    """Check the mapping against the real source columns and target table (writes nothing)."""
+    import anyio
+    from .loads import runtime_for, sources_needed
+    cfg_path, cfg = _load_ctx(config)
+    spec = _get_load(cfg, name)
+
+    async def _v():
+        async with runtime_for(cfg, cfg_path.parent, sources_needed(cfg, spec)) as runner:
+            return await runner.validate(spec)
+    try:
+        problems, warnings, rows = anyio.run(_v)
+    except Exception as exc:
+        _fail(exc)
+    for w in warnings:
+        typer.secho(f"⚠ {w}", fg="yellow")
+    if problems:
+        for p in problems:
+            typer.secho(f"✗ {p}", fg="red", err=True)
+        raise typer.Exit(1)
+    _ok(f"Load '{name}' is valid ({len(spec.columns)} columns mapped, source has {len(rows)} rows)")
+
+
+@load_app.command("run")
+def load_run(
+    name: str,
+    dry_run: bool = typer.Option(False, "--dry-run", help="Read, map and validate every row; write nothing."),
+    preview: int = typer.Option(0, "--preview", help="Show N rows before/after mapping."),
+    as_json: bool = typer.Option(False, "--json", help="Print the run report as JSON."),
+    config: str = CONFIG_OPT,
+):
+    """Run a load job. Exit code: 0 = all rows loaded, 2 = loaded with rejects, 1 = failed (rolled back)."""
+    import anyio
+    from .loads import runtime_for, sources_needed
+    cfg_path, cfg = _load_ctx(config)
+    spec = _get_load(cfg, name)
+
+    async def _r():
+        async with runtime_for(cfg, cfg_path.parent, sources_needed(cfg, spec)) as runner:
+            return await runner.run(spec, dry_run=dry_run, preview=preview)
+    try:
+        rep = anyio.run(_r)
+    except Exception as exc:
+        _fail(exc)
+    _print_report(rep, as_json)
+    raise typer.Exit(rep.exit_code)
+
+
+@load_app.command("history")
+def load_history(name: Optional[str] = typer.Argument(None), last: int = typer.Option(10, "--last"),
+                 config: str = CONFIG_OPT):
+    """Show recent load runs."""
+    import json as _json
+    cfg_path, _ = _load_ctx(config)
+    path = cfg_path.parent / "logs" / "loads" / "history.jsonl"
+    if not path.exists():
+        typer.echo("No runs yet.")
+        return
+    runs = [_json.loads(l) for l in path.read_text(encoding="utf-8").splitlines() if l.strip()]
+    runs = [r for r in runs if not name or r["load"] == name][-last:]
+    for r in runs:
+        written = r["inserted"] + r["updated"] + r["upserted"]
+        typer.echo(f"{r['started']}  {r['load']:<22} {r['status']:<8} read={r['read']:<6} "
+                   f"written={written:<6} rejected={r['rejected']:<5} {r['seconds']}s  {r['run_id']}"
+                   + (f"  ✗ {r['error'].splitlines()[0]}" if r.get("error") else ""))
 
 
 # ------------------------------------------------------------------ users

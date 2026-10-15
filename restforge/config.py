@@ -276,6 +276,81 @@ class SecuritySettings(BaseModel):
     audit_log: str | None = "logs/audit.jsonl"
 
 
+
+# --------------------------------------------------------------------------- #
+# Load jobs (CSV/endpoint -> mapped -> database table)
+# --------------------------------------------------------------------------- #
+ColumnType = Literal["string", "integer", "number", "boolean", "date", "timestamp"]
+
+
+class ColumnMap(BaseModel):
+    """One target column: where its value comes from and how it is converted."""
+    target: str = Field(pattern=r"^[A-Za-z_][A-Za-z0-9_$#]{0,127}$")
+    source: str | None = None            # source/CSV column name (may contain spaces)
+    value: Any = None                    # constant, or ${now} / ${today} / ${run_id}
+    type: ColumnType = "string"
+    format: str | None = None            # strptime format for date/timestamp, e.g. %m/%d/%Y
+    transform: list[Any] = Field(default_factory=list)   # trim, upper, lower, null_if_empty,
+                                                         # {replace: [old, new]}, {lookup: {...}}
+    default: Any = None                  # used when the source cell is blank
+    required: bool = False
+    max_length: int | None = None
+    review: bool = False                 # set by auto-map for uncertain matches
+
+    @model_validator(mode="after")
+    def _one_input(self) -> "ColumnMap":
+        if self.source is None and self.value is None:
+            raise ValueError(f"column '{self.target}': give 'source' or 'value'")
+        if self.source is not None and self.value is not None:
+            raise ValueError(f"column '{self.target}': use 'source' or 'value', not both")
+        return self
+
+
+class LoadFrom(BaseModel):
+    endpoint: str | None = None          # any GET endpoint (all pages are read)
+    source: str | None = None            # a file source, read directly
+    params: dict[str, Any] = Field(default_factory=dict)   # endpoint params (filters)
+
+    @model_validator(mode="after")
+    def _one(self) -> "LoadFrom":
+        if bool(self.endpoint) == bool(self.source):
+            raise ValueError("load 'from' needs exactly one of 'endpoint' or 'source'")
+        return self
+
+
+class LoadTo(BaseModel):
+    source: str                          # a SQL source with read_only: false
+    table: str = Field(pattern=r"^[A-Za-z_][A-Za-z0-9_$#.]{0,127}$")
+
+
+class LoadSpec(BaseModel):
+    name: str = Field(pattern=_NAME)
+    description: str = ""
+    from_: LoadFrom = Field(alias="from")
+    to: LoadTo
+    mode: Literal["insert", "replace", "upsert"] = "insert"
+    keys: list[str] = Field(default_factory=list)          # target columns for upsert
+    batch_size: int = Field(1000, ge=1, le=50000)
+    max_rejects: int = Field(0, ge=0)
+    unmapped_source_columns: Literal["ignore", "error"] = "ignore"
+    columns: list[ColumnMap] = Field(default_factory=list)
+
+    model_config = {"populate_by_name": True}
+
+    @model_validator(mode="after")
+    def _check(self) -> "LoadSpec":
+        targets = [c.target.lower() for c in self.columns]
+        dupes = {t for t in targets if targets.count(t) > 1}
+        if dupes:
+            raise ValueError(f"load '{self.name}': target columns mapped twice: {sorted(dupes)}")
+        if self.mode == "upsert":
+            if not self.keys:
+                raise ValueError(f"load '{self.name}': mode 'upsert' needs 'keys'")
+            missing = {k.lower() for k in self.keys} - set(targets)
+            if missing:
+                raise ValueError(f"load '{self.name}': upsert keys {sorted(missing)} are not mapped")
+        return self
+
 class ServerSettings(BaseModel):
     host: str = "127.0.0.1"
     port: int = 8080
@@ -291,9 +366,22 @@ class ProjectConfig(BaseModel):
     security: SecuritySettings = Field(default_factory=SecuritySettings)
     sources: dict[str, SourceSpec] = Field(default_factory=dict)
     endpoints: list[EndpointSpec] = Field(default_factory=list)
+    loads: list[LoadSpec] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _integrity(self) -> "ProjectConfig":
+        load_names: set[str] = set()
+        for ld in self.loads:
+            if ld.name in load_names:
+                raise ValueError(f"duplicate load name '{ld.name}'")
+            load_names.add(ld.name)
+            if ld.from_.endpoint and ld.from_.endpoint not in {e.name for e in self.endpoints}:
+                raise ValueError(f"load '{ld.name}' reads unknown endpoint '{ld.from_.endpoint}'")
+            if ld.from_.source and ld.from_.source not in self.sources:
+                raise ValueError(f"load '{ld.name}' reads unknown source '{ld.from_.source}'")
+            tgt = self.sources.get(ld.to.source)
+            if tgt is None or tgt.type != "sql":
+                raise ValueError(f"load '{ld.name}': target '{ld.to.source}' must be a SQL source")
         seen_names: set[str] = set()
         seen_routes: set[tuple[str, str]] = set()
         for ep in self.endpoints:
@@ -323,6 +411,9 @@ class ProjectConfig(BaseModel):
     def save(self, path: str | Path = DEFAULT_CONFIG) -> None:
         data = self.model_dump(mode="json", by_alias=True, exclude_none=True)
         Path(path).write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+
+    def load_job(self, name: str) -> "LoadSpec | None":
+        return next((l for l in self.loads if l.name == name), None)
 
     def endpoint(self, name: str) -> EndpointSpec | None:
         return next((e for e in self.endpoints if e.name == name), None)
