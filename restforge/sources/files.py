@@ -30,10 +30,17 @@ class FileSource(DataSource):
 
     # ------------------------------------------------------------- sandboxing
     def _resolved_path(self) -> Path:
-        root = (Path(self.project_root) / self.security.data_root).resolve()
-        target = (root / self.spec.path).resolve()          # resolves symlinks too
+        try:
+            root = (Path(self.project_root) / self.security.data_root).resolve()
+            target = (root / self.spec.path).resolve()          # resolves symlinks too
+        except OSError as exc:                                  # e.g. WinError 123 (bad characters)
+            raise SourceError(f"Invalid path for source '{self.name}': path={self.spec.path!r}, "
+                              f"data_root={self.security.data_root!r} ({exc.strerror or exc}). "
+                              f"Use just the file name inside the data folder, e.g. 'transfer.csv'",
+                              500) from None
         if root != target and root not in target.parents:
-            raise SourceError(f"File for source '{self.name}' is outside data_root", 500)
+            raise SourceError(f"File for source '{self.name}' ({self.spec.path!r}) is outside the data "
+                              f"folder; copy it into '{self.security.data_root}' and use just its name", 500)
         if target.suffix.lower() not in _SUPPORTED:
             raise SourceError(f"Unsupported file type '{target.suffix}'", 500)
         return target

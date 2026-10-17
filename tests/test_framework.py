@@ -120,7 +120,7 @@ def test_guards(project):
     cfg.security.allowed_upstream_hosts = ["api.example.com"]
     # path traversal
     cfg.sources["f"].path = "../outside.csv"
-    with pytest.raises(ConfigError, match="outside data_root"):
+    with pytest.raises(ConfigError, match="outside the data folder"):
         create_app(cfg, project_root=root)
     cfg.sources["f"].path = "rows.json"
     # callable allow-list

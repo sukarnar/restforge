@@ -1,21 +1,19 @@
-"""restforge CLI – create and manage REST endpoints, credentials and the server."""
+"""restforge CLI – create and manage REST endpoints, credentials and the server.
+
+All logic lives in ``restforge.services``; these commands only collect input and print results.
+"""
 from __future__ import annotations
 
 import os
-import re
-import secrets
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
 import typer
 import yaml
 
-from .config import ColumnMap as ColumnMapModel
-from .config import (DEFAULT_CONFIG, ApiKeyRecord, ConfigError, EndpointSpec, ParamSpec,
-                     ProjectConfig, SourceSpec, UserRecord)
-from .credentials import TYPES, Credential, CredentialError, CredentialManager, generate_master_key
-from .security.hashing import generate_api_key, hash_api_key, hash_password
+from .config import DEFAULT_CONFIG, ConfigError, ProjectConfig
+from .credentials import TYPES
+from .services import Project, ServiceError, Services, load_dotenv  # noqa: F401  (load_dotenv re-exported)
 
 app = typer.Typer(help="restforge – declarative, secure REST endpoints for any data source.",
                   no_args_is_help=True)
@@ -35,38 +33,42 @@ CONFIG_OPT = typer.Option(DEFAULT_CONFIG, "--config", "-c", help="Project config
 
 
 # ------------------------------------------------------------------ helpers
-def _load(path: str) -> ProjectConfig:
-    try:
-        return ProjectConfig.load(path)
-    except ConfigError as exc:
-        typer.secho(f"✗ {exc}", fg="red", err=True)
-        raise typer.Exit(1)
-
-
-def _save(cfg: ProjectConfig, path: str) -> None:
-    try:
-        # re-validate the whole document before writing
-        ProjectConfig.model_validate(cfg.model_dump(mode="json", by_alias=True))
-    except Exception as exc:
-        typer.secho(f"✗ {exc}", fg="red", err=True)
-        raise typer.Exit(1)
-    cfg.save(path)
+def _fail(exc: Exception) -> None:
+    typer.secho(f"✗ {exc}", fg="red", err=True)
+    raise typer.Exit(1)
 
 
 def _ok(msg: str) -> None:
     typer.secho(f"✓ {msg}", fg="green")
 
 
-def load_dotenv(path: Path) -> None:
-    """Minimal .env loader (KEY=VALUE lines). Existing env vars win."""
-    if not path.exists():
-        return
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        k, v = line.split("=", 1)
-        os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+def _warn(msgs) -> None:
+    for m in msgs:
+        typer.secho(f"⚠ {m}", fg="yellow")
+
+
+def _svc(config: str) -> Services:
+    try:
+        return Services.open(config)
+    except ServiceError as exc:
+        _fail(exc)
+
+
+def _load(path: str) -> ProjectConfig:
+    try:
+        return ProjectConfig.load(path)
+    except ConfigError as exc:
+        _fail(exc)
+
+
+def _save(cfg: ProjectConfig, path: str) -> None:
+    """Used by the load commands: validate + atomic save with backup via Project."""
+    proj = Project(path)
+    proj.config = cfg
+    try:
+        proj.save(force=True)
+    except ServiceError as exc:
+        _fail(exc)
 
 
 def _kv(pairs: list[str]) -> dict[str, str]:
@@ -79,31 +81,19 @@ def _kv(pairs: list[str]) -> dict[str, str]:
     return out
 
 
+def _run(fn, *a, **kw):
+    try:
+        return fn(*a, **kw)
+    except ServiceError as exc:
+        _fail(exc)
+
+
 # ------------------------------------------------------------------- init
 @app.command()
 def init(name: str = typer.Option("restforge-project", help="Project name."),
          directory: Path = typer.Argument(Path("."), help="Target directory.")):
     """Create a new project (restforge.yaml, .env with a generated JWT secret, .gitignore)."""
-    directory.mkdir(parents=True, exist_ok=True)
-    cfg_path = directory / DEFAULT_CONFIG
-    if cfg_path.exists():
-        typer.secho(f"✗ {cfg_path} already exists", fg="red", err=True)
-        raise typer.Exit(1)
-    ProjectConfig(project=name).save(cfg_path)
-    env = directory / ".env"
-    if not env.exists():
-        env.write_text("# Secrets – never commit this file\n"
-                       f"RESTFORGE_JWT_SECRET={secrets.token_urlsafe(48)}\n"
-                       f"RESTFORGE_MASTER_KEY={generate_master_key()}\n", encoding="utf-8")
-        try:
-            os.chmod(env, 0o600)
-        except OSError:
-            pass
-    gi = directory / ".gitignore"
-    if not gi.exists():
-        gi.write_text(".env\nlogs/\n__pycache__/\n.restforge/\n", encoding="utf-8")
-    for d in ("data", "handlers", "logs"):
-        (directory / d).mkdir(exist_ok=True)
+    _run(Project.init, directory, name)
     _ok(f"Initialised project '{name}' in {directory.resolve()}")
     typer.echo("Credential vault ready (master key in .env). Add logins with: restforge cred add …")
     typer.echo("Next: restforge source add …  →  restforge endpoint add …  →  restforge key create …  →  restforge serve")
@@ -115,7 +105,7 @@ def source_add(
     name: str,
     type: str = typer.Option(..., "--type", "-t", help="sql | file | rest | callable"),
     url: Optional[str] = typer.Option(None, help="SQLAlchemy URL – use ${ENV:VAR} for credentials."),
-    path: Optional[str] = typer.Option(None, help="File path relative to data_root."),
+    path: Optional[str] = typer.Option(None, help="File name inside the data folder."),
     sheet: Optional[str] = typer.Option(None, help="Excel sheet name."),
     base_url: Optional[str] = typer.Option(None, help="Upstream REST base URL."),
     header: list[str] = typer.Option([], help="Upstream header KEY=VALUE (repeatable)."),
@@ -129,31 +119,11 @@ def source_add(
     config: str = CONFIG_OPT,
 ):
     """Register a data source."""
-    cfg = _load(config)
-    if name in cfg.sources:
-        typer.secho(f"✗ source '{name}' already exists", fg="red", err=True)
-        raise typer.Exit(1)
-    if url and "://" in url and "@" in url and "${" not in url:
-        typer.secho("⚠ The URL appears to contain inline credentials. Use --credential instead.", fg="yellow")
-    try:
-        spec = SourceSpec(type=type, url=url, path=path, sheet=sheet, base_url=base_url,
-                          headers=_kv(header), module=module, read_only=not read_write,
-                          credential=credential, credentials=allow_credential,
-                          description=description)
-    except Exception as exc:
-        typer.secho(f"✗ {exc}", fg="red", err=True)
-        raise typer.Exit(1)
-    cfg.sources[name] = spec
-    if type == "callable" and module:
-        root_mod = module.split(".")[0]
-        if root_mod not in cfg.security.allowed_callable_modules:
-            cfg.security.allowed_callable_modules.append(root_mod)
-    if type == "rest" and allow_host:
-        from urllib.parse import urlsplit
-        host = urlsplit(base_url).hostname
-        if host and host not in cfg.security.allowed_upstream_hosts:
-            cfg.security.allowed_upstream_hosts.append(host)
-    _save(cfg, config)
+    s = _svc(config)
+    warnings = _run(s.sources.add, name, type, url=url, path=path, sheet=sheet, base_url=base_url,
+                    headers=_kv(header), module=module, read_write=read_write, allow_host=allow_host,
+                    credential=credential, allow_credentials=allow_credential, description=description)
+    _warn(warnings)
     _ok(f"Source '{name}' ({type}) added")
 
 
@@ -161,33 +131,32 @@ def source_add(
 def source_set_credential(name: str, credential: Optional[str] = typer.Argument(None, help="Omit to unset."),
                           config: str = CONFIG_OPT):
     """Attach (or detach) a managed credential to an existing source."""
-    cfg = _load(config)
-    if name not in cfg.sources:
-        raise typer.BadParameter(f"no source '{name}'")
-    cfg.sources[name].credential = credential
-    _save(cfg, config)
+    _run(_svc(config).sources.set_credential, name, credential)
     _ok(f"Source '{name}' now uses credential {credential!r}")
 
 
 @source_app.command("list")
 def source_list(config: str = CONFIG_OPT):
-    cfg = _load(config)
-    for name, s in cfg.sources.items():
-        detail = s.url or s.path or s.base_url or s.module or ""
-        if s.credential:
-            detail += f" (credential: {s.credential})"
-        ro = " [read-only]" if s.type == "sql" and s.read_only else ""
-        typer.echo(f"{name:<20} {s.type:<9} {detail}{ro}")
+    for s in _svc(config).sources.list():
+        detail = s["detail"] + (f" (credential: {s['credential']})" if s["credential"] else "")
+        ro = " [read-only]" if s["read_only"] else ""
+        typer.echo(f"{s['name']:<20} {s['type']:<9} {detail}{ro}")
+
+
+@source_app.command("test")
+def source_test(name: str, config: str = CONFIG_OPT):
+    """Check a source: DB connection, file readable (shows first rows), module import, host allowed."""
+    r = _svc(config).sources.test(name)
+    if not r.ok:
+        _fail(Exception(r.message))
+    _ok(r.message)
+    for row in r.rows:
+        typer.echo(f"  {row}")
 
 
 @source_app.command("remove")
 def source_remove(name: str, config: str = CONFIG_OPT):
-    cfg = _load(config)
-    if any(e.source == name for e in cfg.endpoints):
-        typer.secho("✗ endpoints still use this source; remove them first", fg="red", err=True)
-        raise typer.Exit(1)
-    cfg.sources.pop(name, None)
-    _save(cfg, config)
+    _run(_svc(config).sources.remove, name)
     _ok(f"Source '{name}' removed")
 
 
@@ -203,52 +172,28 @@ def endpoint_add(
     public: bool = typer.Option(False, "--public", help="No authentication (use with care)."),
     rate_limit: Optional[int] = typer.Option(None, help="Requests per window for this endpoint."),
     description: str = "",
-    # sql
     query: Optional[str] = typer.Option(None, help="SQL with :named binds."),
     operation: Optional[str] = typer.Option(None, help="list|get|create|update|delete (table mode)"),
     table: Optional[str] = None,
     key: Optional[str] = None,
     columns: Optional[str] = typer.Option(None, help="Comma-separated column allow-list."),
-    # file
     filter: list[str] = typer.Option([], "--filter", help="Filterable field (repeatable)."),
-    # rest
     upstream_path: Optional[str] = None,
     upstream_method: Optional[str] = None,
-    # callable
     target: Optional[str] = typer.Option(None, help="module:function"),
     max_limit: int = 500,
     config: str = CONFIG_OPT,
 ):
     """Create an endpoint."""
-    cfg = _load(config)
-    if cfg.endpoint(name):
-        typer.secho(f"✗ endpoint '{name}' already exists", fg="red", err=True)
-        raise typer.Exit(1)
-    if public and scope:
-        typer.secho("✗ --public and --scope are mutually exclusive", fg="red", err=True)
-        raise typer.Exit(1)
-    try:
-        params = [ParamSpec.parse_short(p) for p in param]
-        for f in filter:   # filters are implicit optional query params
-            if not any(p.name == f for p in params):
-                params.append(ParamSpec(name=f))
-        ep = EndpointSpec(
-            name=name, source=source, path=path, method=method.upper(), params=params,
-            scopes=scope, public=public, rate_limit=rate_limit, description=description,
-            query=query, operation=operation or ("query" if query else None), table=table, key=key,
-            columns=[c.strip() for c in columns.split(",")] if columns else None,
-            filters=filter, upstream_path=upstream_path,
-            upstream_method=upstream_method.upper() if upstream_method else None,
-            target=target, max_limit=max_limit,
-        )
-    except Exception as exc:
-        typer.secho(f"✗ {exc}", fg="red", err=True)
-        raise typer.Exit(1)
-    cfg.endpoints.append(ep)
-    _save(cfg, config)
-    if public:
-        typer.secho(f"⚠ '{name}' is PUBLIC – anyone can call it.", fg="yellow")
-    _ok(f"Endpoint '{name}': {ep.method} {cfg.server.base_path}{ep.path}")
+    s = _svc(config)
+    ep, warnings = _run(s.endpoints.add, name, source, path, method=method, params=param, scopes=scope,
+                        public=public, rate_limit=rate_limit, description=description, query=query,
+                        operation=operation, table=table, key=key,
+                        columns=[c.strip() for c in columns.split(",")] if columns else None,
+                        filters=filter, upstream_path=upstream_path, upstream_method=upstream_method,
+                        target=target, max_limit=max_limit)
+    _warn([w for w in warnings if "PUBLIC" in w])
+    _ok(f"Endpoint '{name}': {ep.method} {s.project.config.server.base_path}{ep.path}")
 
 
 @endpoint_app.command("crud")
@@ -266,66 +211,38 @@ def endpoint_crud(
     config: str = CONFIG_OPT,
 ):
     """Generate list/get/create/update/delete endpoints for a SQL table."""
-    cfg = _load(config)
-    rs = read_scope or f"{resource}:read"
-    ws = write_scope or f"{resource}:write"
-    fields = [ParamSpec.parse_short(f) for f in field]
-    cols = [key] + [f.name for f in fields] + [f for f in filter if f not in {x.name for x in fields}]
-    columns = list(dict.fromkeys(cols)) if fields or filter else None
-    kp = ParamSpec(name=key, type=key_type, location="path", required=True)
-    body = lambda req: [f.model_copy(update={"location": "body", "required": req and f.required}) for f in fields]
-    specs = [
-        dict(name=f"{resource}-list", path=f"/{resource}", method="GET", operation="list",
-             params=[ParamSpec(name=f) for f in filter], scopes=[rs]),
-        dict(name=f"{resource}-get", path=f"/{resource}/{{{key}}}", method="GET", operation="get",
-             params=[kp], scopes=[rs]),
-    ]
-    if not read_only:
-        specs += [
-            dict(name=f"{resource}-create", path=f"/{resource}", method="POST", operation="create",
-                 params=body(True), scopes=[ws]),
-            dict(name=f"{resource}-update", path=f"/{resource}/{{{key}}}", method="PATCH",
-                 operation="update", params=[kp] + body(False), scopes=[ws]),
-            dict(name=f"{resource}-delete", path=f"/{resource}/{{{key}}}", method="DELETE",
-                 operation="delete", params=[kp], scopes=[ws]),
-        ]
-    try:
-        for s in specs:
-            cfg.endpoints.append(EndpointSpec(source=source, table=table, key=key, columns=columns,
-                                              tags=[resource], **s))
-    except Exception as exc:
-        typer.secho(f"✗ {exc}", fg="red", err=True)
-        raise typer.Exit(1)
-    _save(cfg, config)
-    _ok(f"Generated {len(specs)} endpoints for '{resource}' (scopes: {rs}{'' if read_only else ', ' + ws})")
+    new, rs, ws = _run(_svc(config).endpoints.crud, resource, source, table, key, key_type=key_type,
+                       fields=field, filters=filter, read_scope=read_scope, write_scope=write_scope,
+                       read_only=read_only)
+    _ok(f"Generated {len(new)} endpoints for '{resource}' (scopes: {rs}{'' if read_only else ', ' + ws})")
 
 
 @endpoint_app.command("list")
 def endpoint_list(config: str = CONFIG_OPT):
-    cfg = _load(config)
-    base = cfg.server.base_path
-    for e in cfg.endpoints:
-        auth = "PUBLIC" if e.public else (",".join(e.scopes) or "auth")
-        typer.echo(f"{e.method:<7} {base + e.path:<36} {e.name:<24} {e.source:<14} {auth}")
+    for e in _svc(config).endpoints.list():
+        typer.echo(f"{e['method']:<7} {e['path']:<36} {e['name']:<24} {e['source']:<14} {e['access']}")
 
 
 @endpoint_app.command("show")
 def endpoint_show(name: str, config: str = CONFIG_OPT):
-    cfg = _load(config)
-    ep = cfg.endpoint(name)
-    if not ep:
-        raise typer.BadParameter(f"no endpoint '{name}'")
+    ep = _run(_svc(config).endpoints.get, name)
     typer.echo(yaml.safe_dump(ep.model_dump(mode="json", by_alias=True, exclude_none=True), sort_keys=False))
+
+
+@endpoint_app.command("set-access")
+def endpoint_set_access(name: str, public: bool = typer.Option(False, "--public"),
+                        scope: list[str] = typer.Option([], "--scope"), config: str = CONFIG_OPT):
+    """Make an endpoint public, or set the scopes it requires."""
+    if not public and not scope:
+        raise typer.BadParameter("give --public or at least one --scope")
+    _run(_svc(config).endpoints.set_access, name, public=public, scopes=scope)
+    _ok(f"Endpoint '{name}' is now {'PUBLIC' if public else 'restricted to ' + ', '.join(scope)} "
+        "(restart the server to apply)")
 
 
 @endpoint_app.command("remove")
 def endpoint_remove(name: str, config: str = CONFIG_OPT):
-    cfg = _load(config)
-    before = len(cfg.endpoints)
-    cfg.endpoints = [e for e in cfg.endpoints if e.name != name]
-    if len(cfg.endpoints) == before:
-        raise typer.BadParameter(f"no endpoint '{name}'")
-    _save(cfg, config)
+    _run(_svc(config).endpoints.remove, name)
     _ok(f"Endpoint '{name}' removed")
 
 
@@ -335,82 +252,45 @@ def key_create(name: str, scope: list[str] = typer.Option([], "--scope"),
                expires_days: Optional[int] = typer.Option(90, help="0 = never expires."),
                config: str = CONFIG_OPT):
     """Create an API key. The plaintext key is printed ONCE."""
-    cfg = _load(config)
-    key_id, plaintext = generate_api_key()
-    now = datetime.now(timezone.utc)
-    expires = (now + timedelta(days=expires_days)).isoformat() if expires_days else None
-    cfg.security.api_keys.append(ApiKeyRecord(id=key_id, name=name, hash=hash_api_key(plaintext),
-                                              scopes=scope, created=now.isoformat(), expires=expires))
-    _save(cfg, config)
-    _ok(f"API key '{name}' created (id {key_id}, scopes: {', '.join(scope) or 'none'})")
-    typer.secho(f"\n  {plaintext}\n", bold=True)
-    typer.echo("Store it now – it cannot be shown again. Send it in the "
-               f"'{cfg.security.api_key_header}' header.")
+    k = _run(_svc(config).access.create_key, name, scope, expires_days)
+    _ok(f"API key '{name}' created (id {k.id}, scopes: {', '.join(scope) or 'none'})")
+    typer.secho(f"\n  {k.plaintext}\n", bold=True)
+    typer.echo(f"Store it now – it cannot be shown again. Send it in the '{k.header}' header.")
 
 
 @key_app.command("list")
 def key_list(config: str = CONFIG_OPT):
-    cfg = _load(config)
-    for k in cfg.security.api_keys:
-        state = "revoked" if k.disabled else "active"
-        typer.echo(f"{k.id}  {k.name:<20} {state:<8} expires={k.expires or 'never'}  scopes={','.join(k.scopes)}")
+    for k in _svc(config).access.keys():
+        typer.echo(f"{k['id']}  {k['name']:<20} {k['status']:<8} expires={k['expires'] or 'never'}  "
+                   f"scopes={','.join(k['scopes'])}")
 
 
 @key_app.command("revoke")
 def key_revoke(key_id: str, config: str = CONFIG_OPT):
-    cfg = _load(config)
-    for k in cfg.security.api_keys:
-        if k.id == key_id:
-            k.disabled = True
-            _save(cfg, config)
-            _ok(f"Key {key_id} revoked (restart/reload the server to apply)")
-            return
-    raise typer.BadParameter(f"no key '{key_id}'")
+    _run(_svc(config).access.revoke_key, key_id)
+    _ok(f"Key {key_id} revoked (restart/reload the server to apply)")
 
 
 # ------------------------------------------------------------- credentials
-def _manager(config: str) -> tuple[ProjectConfig, CredentialManager]:
-    cfg_path = Path(config).resolve()
-    load_dotenv(cfg_path.parent / ".env")
-    cfg = _load(config)
-    try:
-        return cfg, CredentialManager.from_settings(cfg.security.credentials, cfg_path.parent)
-    except CredentialError as exc:
-        typer.secho(f"✗ {exc}", fg="red", err=True)
-        raise typer.Exit(1)
-
-
-def _fail(exc: Exception) -> None:
-    typer.secho(f"✗ {exc}", fg="red", err=True)
-    raise typer.Exit(1)
-
-
-def _set_env_line(env: Path, key: str, value: str) -> None:
-    lines = env.read_text(encoding="utf-8").splitlines() if env.exists() else []
-    lines = [l for l in lines if not l.startswith(f"{key}=")] + [f"{key}={value}"]
-    env.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    try:
-        os.chmod(env, 0o600)
-    except OSError:
-        pass
-
-
 def _collect_fields(ctype: str, field: list[str], secret_from_env: list[str],
                     existing: dict | None = None, prompt_all_secrets: bool = True) -> dict:
+    """Interactive part of credential entry: secrets are prompted with hidden input."""
     fields = dict(existing or {})
-    fields.update(_kv(field))
-    for k, var in _kv(secret_from_env).items():          # non-interactive (CI) secrets
+    given = _kv(field)
+    fields.update(given)
+    from_env = _kv(secret_from_env)
+    for k, var in from_env.items():
         if var not in os.environ:
             raise typer.BadParameter(f"environment variable '{var}' is not set")
         fields[k] = os.environ[var]
     t = TYPES[ctype]
-    cli_secrets = set(_kv(field)) & set(t.secret)
-    if cli_secrets:
-        typer.secho(f"⚠ secret field(s) {sorted(cli_secrets)} passed on the command line may be kept in "
-                    "shell history; omit them to be prompted instead.", fg="yellow")
+    if set(given) & set(t.secret):
+        typer.secho(f"⚠ secret field(s) {sorted(set(given) & set(t.secret))} passed on the command line may be "
+                    "kept in shell history; omit them to be prompted instead.", fg="yellow")
     for k in sorted(t.secret):
-        provided = k in _kv(field) or k in _kv(secret_from_env)
-        if not provided and (prompt_all_secrets or k not in fields):
+        if k in given or k in from_env:
+            continue
+        if prompt_all_secrets or k not in fields:
             if ctype == "database" and k == "password" and str(fields.get("driver", "")).startswith("sqlite"):
                 continue
             fields[k] = typer.prompt(f"{k}", hide_input=True, confirmation_prompt=True)
@@ -424,19 +304,16 @@ def cred_init(passphrase: bool = typer.Option(False, "--passphrase",
                                               help="Use a passphrase you keep yourself instead of a generated key."),
               config: str = CONFIG_OPT):
     """Create the vault master key (stored in .env, never in the vault or YAML)."""
-    cfg_path = Path(config).resolve()
-    cfg = _load(config)
-    env_name = cfg.security.credentials.master_key_env
-    load_dotenv(cfg_path.parent / ".env")
-    if os.environ.get(env_name):
-        typer.secho(f"✗ {env_name} is already set – use 'restforge cred rekey' to change it", fg="red", err=True)
-        raise typer.Exit(1)
+    s = _svc(config)
+    st = s.credentials.vault_status()
     if passphrase:
+        if st["key_present"]:
+            _fail(Exception(f"{st['key_env']} is already set – use 'restforge cred rekey' to change it"))
         typer.prompt("Master passphrase (min 16 chars)", hide_input=True, confirmation_prompt=True)
-        typer.echo(f"Not stored. Set {env_name} to this passphrase in the server's environment "
+        typer.echo(f"Not stored. Set {st['key_env']} to this passphrase in the server's environment "
                    "(e.g. a service/secret manager variable).")
         return
-    _set_env_line(cfg_path.parent / ".env", env_name, generate_master_key())
+    env_name = _run(s.credentials.init_vault)
     _ok(f"Master key generated and written to .env as {env_name}")
     typer.echo("Back it up somewhere safe (password manager). Without it the vault cannot be decrypted.")
 
@@ -471,21 +348,14 @@ def cred_add(
     """Store a credential. Secret fields are prompted with hidden input."""
     if type not in TYPES:
         raise typer.BadParameter(f"type must be one of {', '.join(TYPES)}")
-    if not re.match(r"^[a-zA-Z][a-zA-Z0-9_\-]{0,63}$", name):
-        raise typer.BadParameter("name: letters, digits, '_' or '-' (max 64)")
-    cfg, mgr = _manager(config)
-    try:
-        if any(c.name == name for c in mgr.list()):
-            raise CredentialError(f"credential '{name}' exists – use 'restforge cred rotate'")
-        fields = _collect_fields(type, field, secret_from_env)
-        for k in secret:
-            fields[k] = typer.prompt(k, hide_input=True, confirmation_prompt=True)
-        expires = ((datetime.now(timezone.utc) + timedelta(days=expires_days)).isoformat(timespec="seconds")
-                   if expires_days else None)
-        where = mgr.put(Credential(name=name, type=type, fields=fields, description=description,
-                                   expires=expires, secret_fields=secret), provider)
-    except (CredentialError, ValueError) as exc:
-        _fail(exc)
+    s = _svc(config)
+    if any(c["name"] == name for c in _run(s.credentials.list)):
+        _fail(Exception(f"credential '{name}' exists – use 'restforge cred rotate'"))
+    fields = _collect_fields(type, field, secret_from_env)
+    for k in secret:
+        fields[k] = typer.prompt(k, hide_input=True, confirmation_prompt=True)
+    where = _run(s.credentials.add, name, type, fields, secret_fields=secret, expires_days=expires_days,
+                 provider=provider, description=description)
     _ok(f"Credential '{name}' ({type}) stored in {where}")
     typer.echo(f"Use it:  restforge source add <name> --type ... --credential {name}   "
                f"or  ${{CRED:{name}.<field>}}")
@@ -494,39 +364,26 @@ def cred_add(
 @cred_app.command("list")
 def cred_list(config: str = CONFIG_OPT):
     """List credentials (metadata only – never secrets)."""
-    cfg, mgr = _manager(config)
-    users = _credential_users(cfg)
-    try:
-        creds = mgr.list()
-    except CredentialError as exc:
-        _fail(exc)
+    creds = _run(_svc(config).credentials.list)
     if not creds:
         typer.echo("No credentials yet. Add one with 'restforge cred add'.")
-    now = datetime.now(timezone.utc)
     for c in creds:
-        state = ""
-        if c.expires:
-            days = (datetime.fromisoformat(c.expires) - now).days
-            state = "EXPIRED" if days < 0 else f"expires in {days}d"
-        typer.echo(f"{c.name:<20} {c.type:<9} {c.provider:<9} {state:<16} "
-                   f"fields={','.join(sorted(c.fields))}  used-by={','.join(users.get(c.name, [])) or '-'}")
+        state = {"expired": "EXPIRED", "never": ""}.get(c["expiry_state"], f"expires in {c['days_left']}d")
+        typer.echo(f"{c['name']:<20} {c['type']:<9} {c['provider']:<9} {state:<16} "
+                   f"fields={','.join(c['fields'])}  used-by={','.join(c['used_by']) or '-'}")
 
 
 @cred_app.command("show")
 def cred_show(name: str, reveal: bool = typer.Option(False, "--reveal", help="Print secret values."),
               config: str = CONFIG_OPT):
     """Show one credential (secrets masked unless --reveal)."""
-    cfg, mgr = _manager(config)
-    try:
-        c = mgr.get(name)
-    except CredentialError as exc:
-        _fail(exc)
-    if reveal and not typer.confirm(f"Print secret values of '{name}' to the terminal?"):
-        raise typer.Exit(1)
-    typer.echo(yaml.safe_dump({"name": c.name, "type": c.type, "provider": c.provider,
-                               "description": c.description, "created": c.created, "updated": c.updated,
-                               "expires": c.expires, "fields": c.fields if reveal else c.masked()},
-                              sort_keys=False))
+    s = _svc(config)
+    info = _run(s.credentials.masked, name)
+    if reveal:
+        if not typer.confirm(f"Print secret values of '{name}' to the terminal?"):
+            raise typer.Exit(1)
+        info["fields"] = _run(s.credentials.get, name).fields
+    typer.echo(yaml.safe_dump(info, sort_keys=False))
 
 
 @cred_app.command("rotate")
@@ -538,35 +395,21 @@ def cred_rotate(name: str,
                 config: str = CONFIG_OPT):
     """Replace a credential's secret(s). Running servers pick it up within cache_ttl_seconds
     and rebuild their connection pools – no restart needed."""
-    cfg, mgr = _manager(config)
-    try:
-        c = mgr.get(name)
-        c.fields = _collect_fields(c.type, field, secret_from_env, existing=c.fields,
-                                   prompt_all_secrets=not keep_secrets)
+    s = _svc(config)
+    c = _run(s.credentials.get, name)
+    changes = _collect_fields(c.type, field, secret_from_env, existing=c.fields,
+                              prompt_all_secrets=not keep_secrets)
+    if not keep_secrets:
         for k in c.secret_fields:
-            if not keep_secrets:
-                c.fields[k] = typer.prompt(k, hide_input=True, confirmation_prompt=True)
-        if expires_days:
-            c.expires = (datetime.now(timezone.utc) + timedelta(days=expires_days)).isoformat(timespec="seconds")
-        provider = c.provider if c.provider != "env" else None
-        mgr.put(c, provider)
-    except (CredentialError, ValueError) as exc:
-        _fail(exc)
+            changes[k] = typer.prompt(k, hide_input=True, confirmation_prompt=True)
+    _run(s.credentials.rotate, name, changes, expires_days=expires_days)
     _ok(f"Credential '{name}' rotated")
 
 
 @cred_app.command("remove")
 def cred_remove(name: str, force: bool = typer.Option(False, "--force"), config: str = CONFIG_OPT):
     """Delete a credential (refuses while sources still use it, unless --force)."""
-    cfg, mgr = _manager(config)
-    users = _credential_users(cfg).get(name)
-    if users and not force:
-        _fail(CredentialError(f"credential '{name}' is used by {users}; detach first or use --force"))
-    try:
-        if not mgr.delete(name):
-            _fail(CredentialError(f"no credential '{name}'"))
-    except CredentialError as exc:
-        _fail(exc)
+    _run(_svc(config).credentials.remove, name, force)
     _ok(f"Credential '{name}' removed")
 
 
@@ -574,75 +417,22 @@ def cred_remove(name: str, force: bool = typer.Option(False, "--force"), config:
 def cred_test(name: str, url: Optional[str] = typer.Option(None, help="HTTP types: URL to GET with the auth."),
               config: str = CONFIG_OPT):
     """Check that a credential works (DB login, OAuth token fetch, or an authenticated GET)."""
-    import httpx
-    from sqlalchemy import create_engine, literal, select
-    from .credentials import build_http_auth, build_sql_url
-
-    cfg, mgr = _manager(config)
-    try:
-        c = mgr.get(name)
-        if c.type == "database":
-            eng = create_engine(build_sql_url(c))
-            with eng.connect() as conn:
-                conn.execute(select(literal(1)))
-            eng.dispose()
-            _ok(f"Connected to database with '{name}'")
-        elif c.type == "generic":
-            _ok(f"'{name}' decrypted OK ({len(c.fields)} fields)")
-        else:
-            auth, headers, params = build_http_auth(c, cfg.security.allowed_upstream_hosts)
-            if c.type == "oauth2" and not url:
-                with httpx.Client(timeout=10) as client:
-                    flow = auth.auth_flow(httpx.Request("GET", "https://placeholder.invalid/"))
-                    auth._store(client.send(next(flow)))
-                _ok(f"OAuth token obtained for '{name}'")
-            elif url:
-                with httpx.Client(timeout=10, auth=auth, headers=headers, follow_redirects=False) as client:
-                    r = client.get(url, params=params)
-                (_ok if r.status_code < 400 else _fail_soft)(f"GET {url} -> HTTP {r.status_code}")
-            else:
-                _ok(f"'{name}' is valid; pass --url to test it against an endpoint")
-    except Exception as exc:
-        _fail(Exception(mgr.redact(f"{type(exc).__name__}: {exc}")))
-
-
-def _fail_soft(msg: str) -> None:
-    typer.secho(f"✗ {msg}", fg="red", err=True)
-    raise typer.Exit(1)
+    ok, msg = _svc(config).credentials.test(name, url)
+    if not ok:
+        _fail(Exception(msg))
+    _ok(msg)
 
 
 @cred_app.command("rekey")
 def cred_rekey(passphrase: bool = typer.Option(False, "--passphrase"), config: str = CONFIG_OPT):
     """Re-encrypt the vault under a new master key (key rotation)."""
-    cfg, mgr = _manager(config)
-    vault = next((p for p in mgr.providers if p.name == "vault"), None)
-    if vault is None:
-        _fail(CredentialError("the 'vault' provider is not enabled"))
-    new = (typer.prompt("New master passphrase", hide_input=True, confirmation_prompt=True)
-           if passphrase else generate_master_key())
-    try:
-        n = vault.rekey(new)
-    except CredentialError as exc:
-        _fail(exc)
-    if not passphrase:
-        _set_env_line(Path(config).resolve().parent / ".env", cfg.security.credentials.master_key_env, new)
-        _ok(f"Re-encrypted {n} credential(s); new key written to .env")
-    else:
-        _ok(f"Re-encrypted {n} credential(s); update {cfg.security.credentials.master_key_env} on the server")
+    s = _svc(config)
+    new = typer.prompt("New master passphrase", hide_input=True, confirmation_prompt=True) if passphrase else None
+    n = _run(s.credentials.rekey, new)
+    env_name = s.project.config.security.credentials.master_key_env
+    _ok(f"Re-encrypted {n} credential(s); " + (f"update {env_name} on the server" if passphrase
+                                                 else "new key written to .env"))
     typer.echo("Restart running servers so they use the new master key.")
-
-
-def _credential_users(cfg: ProjectConfig) -> dict[str, list[str]]:
-    from .config import credential_refs
-    users: dict[str, list[str]] = {}
-    for sname, s in cfg.sources.items():
-        names = ({s.credential} if s.credential else set()) | set(s.credentials) | \
-            credential_refs(s.url) | credential_refs(s.headers)
-        for n in names:
-            users.setdefault(n, []).append(f"source:{sname}")
-    for n in credential_refs(cfg.security.jwt.secret):
-        users.setdefault(n, []).append("jwt")
-    return users
 
 
 # ------------------------------------------------------------------ loads
@@ -651,17 +441,11 @@ load_app = typer.Typer(help="Load data from a CSV/file source or endpoint into a
 app.add_typer(load_app, name="load")
 
 
-def _load_ctx(config: str):
-    cfg_path = Path(config).resolve()
-    load_dotenv(cfg_path.parent / ".env")
-    return cfg_path, _load(str(cfg_path))
-
-
-def _get_load(cfg: ProjectConfig, name: str):
-    spec = cfg.load_job(name)
-    if spec is None:
+def _get_load(svc: Services, name: str):
+    try:
+        return svc.loads.get(name)
+    except ServiceError:
         _fail(Exception(f"no load '{name}' – see 'restforge load list'"))
-    return spec
 
 
 def _print_mapping(spec) -> None:
@@ -697,17 +481,33 @@ def _print_report(rep, as_json: bool) -> None:
     if as_json:
         typer.echo(_json.dumps(rep.to_dict(), indent=2, default=str))
         return
-    color = {"success": "green", "dry_run": "cyan", "partial": "yellow", "failed": "red"}[rep.status]
+    color = {"success": "green", "dry_run": "cyan", "partial": "yellow", "failed": "red",
+             "skipped": "blue"}[rep.status]
     typer.secho(f"{rep.status.upper()}  load={rep.load} run={rep.run_id} mode={rep.mode} ({rep.seconds}s)",
                 fg=color, bold=True)
     typer.echo(f"  read={rep.read} mapped={rep.mapped} rejected={rep.rejected} "
-               f"inserted={rep.inserted} updated={rep.updated} upserted={rep.upserted} deleted={rep.deleted}")
+               f"inserted={rep.inserted} updated={rep.updated} upserted={rep.upserted} deleted={rep.deleted}"
+               + (f" dropped_duplicates={rep.dropped}" if rep.dropped else "")
+               + (f" skipped_existing={rep.skipped}" if rep.skipped else ""))
+    if rep.source_hash:
+        state = {True: "CHANGED since the last load", False: "unchanged since the last load",
+                 None: "first load"}[rep.source_changed]
+        ver = f"v{rep.source_version}" if rep.source_version else "new data"
+        typer.echo(f"  source: {ver} ({rep.source_hash[:12]}) – {state}"
+                   + (f" (v{rep.last_loaded_version}, run {rep.last_loaded_run})" if rep.last_loaded_run else ""))
+    if rep.keys:
+        typer.echo(f"  key: {', '.join(rep.keys)}")
+    if rep.table_rows is not None:
+        typer.echo(f"  table had {rep.table_rows} rows before kill & fill")
     for w in rep.warnings:
         typer.secho(f"  ⚠ {w}", fg="yellow")
     if rep.rejects_file:
         typer.echo(f"  rejects: {rep.rejects_file}")
     if rep.error:
-        typer.secho(f"  ✗ {rep.error}", fg="red", err=True)
+        if rep.status == "skipped":
+            typer.secho(f"  {rep.error} (use --force to load anyway)", fg="blue")
+        else:
+            typer.secho(f"  ✗ {rep.error}", fg="red", err=True)
     for p in rep.preview:
         typer.echo(f"  -- record {p['record']}")
         typer.echo(f"     source: {p['source']}")
@@ -730,57 +530,31 @@ def load_create(
     config: str = CONFIG_OPT,
 ):
     """Create a load job (optionally with an auto-suggested column mapping)."""
-    import anyio
-    from .config import LoadSpec
-    from .loads import auto_map, column_type_name, runtime_for, sources_needed
-
-    cfg_path, cfg = _load_ctx(config)
-    if cfg.load_job(name):
+    svc = _svc(config)
+    if svc.project.config.load_job(name):
         _fail(Exception(f"load '{name}' exists – edit it with 'restforge load map'"))
-    try:
-        spec = LoadSpec.model_validate({
-            "name": name, "description": description, "mode": "insert", "batch_size": batch_size,
-            "max_rejects": max_rejects, "to": {"source": to, "table": table},
-            "from": {"endpoint": from_endpoint} if from_endpoint else {"source": from_source}})
-        cfg.loads.append(spec)
-        ProjectConfig.model_validate(cfg.model_dump(mode="json", by_alias=True))
-    except Exception as exc:
-        _fail(exc)
-
+    draft = {"name": name, "description": description, "mode": "insert", "batch_size": batch_size,
+             "max_rejects": max_rejects, "to": {"source": to, "table": table},
+             "from": {"endpoint": from_endpoint} if from_endpoint else {"source": from_source}}
+    _run(svc.loads.build, draft)
+    sug = None
     if auto_map_:
-        async def _suggest():
-            async with runtime_for(cfg, cfg_path.parent, sources_needed(cfg, spec)) as runner:
-                rows = await runner.read_rows(spec)
-                tgt = runner._target(spec)
-                tbl = await anyio.to_thread.run_sync(tgt._table, table)
-                return rows, {c.name: column_type_name(c) for c in tbl.columns}, tbl
-        try:
-            rows, target_cols, tbl = anyio.run(_suggest)
-        except Exception as exc:
-            _fail(exc)
-        if not rows:
-            _fail(Exception("source returned no rows – cannot read its column names"))
-        cols, unmatched = auto_map(list(rows[0].keys()), target_cols)
-        spec.columns = [ColumnMapModel.model_validate(c) for c in cols]
-        mapped = {c["target"] for c in cols}
-        missing_req = [c.name for c in tbl.columns if c.name not in mapped and not c.nullable
-                       and c.server_default is None]
-    spec.mode = mode
-    spec.keys = key
+        sug = _run(svc.loads.suggest, draft)
+        draft["columns"] = sug.columns
+    draft["mode"], draft["keys"] = mode, key
     try:
-        cfg.loads[-1] = LoadSpec.model_validate(spec.model_dump(mode="json", by_alias=True))
-    except Exception as exc:
+        spec = svc.loads.save(draft, force=True)
+    except ServiceError as exc:
         _fail(Exception(f"{exc}\nTip: create with the default mode first, map the key columns, "
-                        f"then set mode/keys in restforge.yaml"))
-    _save(cfg, str(cfg_path))
+                        f"then set them with 'restforge load map {name} --mode upsert --key <col>'"))
     _ok(f"Load '{name}' created ({mode}: {from_endpoint or from_source} -> {to}.{table})")
-    if auto_map_:
-        _print_mapping(cfg.loads[-1])
-        if unmatched:
-            typer.secho(f"  ⚠ source columns with no matching target (ignored): {unmatched}", fg="yellow")
-        if missing_req:
-            typer.secho(f"  ⚠ required target columns not mapped: {missing_req}", fg="yellow")
-        if any(c.review for c in cfg.loads[-1].columns):
+    if sug:
+        _print_mapping(spec)
+        if sug.unmatched:
+            typer.secho(f"  ⚠ source columns with no matching target (ignored): {sug.unmatched}", fg="yellow")
+        if sug.missing_required:
+            typer.secho(f"  ⚠ required target columns not mapped: {sug.missing_required}", fg="yellow")
+        if any(c.review for c in spec.columns):
             typer.secho("  Yellow rows are guesses – confirm each with: "
                         f"restforge load map {name} --set \"<Source>=<target>\"", fg="yellow")
     typer.echo(f"Next: restforge load validate {name}  →  restforge load run {name} --dry-run --preview 3")
@@ -795,14 +569,23 @@ def load_map(
     default: list[str] = typer.Option([], "--default", help='"target=value used when blank"'),
     required: list[str] = typer.Option([], "--required", help="Target column that must have a value."),
     remove: list[str] = typer.Option([], "--remove", help="Target column to unmap."),
-    mode: Optional[str] = typer.Option(None, help="insert | replace | upsert"),
-    key: list[str] = typer.Option([], "--key", help="Upsert key (replaces existing keys when given)."),
+    mode: Optional[str] = typer.Option(None, help="insert | replace (kill & fill) | upsert"),
+    key: list[str] = typer.Option([], "--key", help="Load key target column, any mode (replaces existing keys)."),
+    no_key: bool = typer.Option(False, "--no-key", help="Remove the load key."),
+    duplicate_keys: Optional[str] = typer.Option(None, help="Same key twice in the source: reject | first | last"),
+    existing_keys: Optional[str] = typer.Option(None, help="Insert mode, key already in table: reject | skip | fail"),
+    on_unchanged: Optional[str] = typer.Option(None, help="Source unchanged since last load: skip | load | fail"),
+    on_header_change: Optional[str] = typer.Option(None, help="Source columns changed: fail | warn"),
+    stable_seconds: Optional[int] = typer.Option(None, help="Wait until the file is unchanged this long."),
+    max_age_hours: Optional[float] = typer.Option(None, help="Fail if the file is older (0 = no limit)."),
+    archive_keep: Optional[int] = typer.Option(None, help="Source versions kept as copies (0 = none)."),
+    min_rows: Optional[int] = typer.Option(None, help="Kill & fill: refuse with fewer rows than this."),
+    min_percent: Optional[float] = typer.Option(None, help="Kill & fill: refuse below this % of current rows."),
     config: str = CONFIG_OPT,
 ):
-    """Add or change column mappings of a load job."""
-    from .config import LoadSpec
-    cfg_path, cfg = _load_ctx(config)
-    spec = _get_load(cfg, name)
+    """Add or change column mappings and settings of a load job."""
+    svc = _svc(config)
+    spec = _get_load(svc, name)
     cols = {c.target.lower(): c.model_dump(exclude_none=True) for c in spec.columns}
 
     def _col(target: str) -> dict:
@@ -822,7 +605,6 @@ def load_map(
             entry["type"] = parts[1]
         if len(parts) > 2:
             entry["format"] = parts[2]
-        # one source column -> one target: drop other targets reading the same source with review flags
         cols[parts[0].lower()] = entry
     for item in value:
         tgt, val = item.split("=", 1)
@@ -847,12 +629,22 @@ def load_map(
         data["mode"] = mode
     if key:
         data["keys"] = key
-    try:
-        new = LoadSpec.model_validate(data)
-    except Exception as exc:
-        _fail(exc)
-    cfg.loads = [new if l.name == name else l for l in cfg.loads]
-    _save(cfg, str(cfg_path))
+    if no_key:
+        data["keys"] = []
+    for k, v in (("duplicate_keys", duplicate_keys), ("existing_keys", existing_keys)):
+        if v is not None:
+            data[k] = v
+    tr, sf = data.setdefault("tracking", {}), data.setdefault("safety", {})
+    for k, v in (("on_unchanged", on_unchanged), ("on_header_change", on_header_change),
+                 ("stable_seconds", stable_seconds), ("archive_keep", archive_keep)):
+        if v is not None:
+            tr[k] = v
+    if max_age_hours is not None:
+        tr["max_age_hours"] = max_age_hours or None
+    for k, v in (("min_rows", min_rows), ("min_percent", min_percent)):
+        if v is not None:
+            sf[k] = v
+    new = _run(svc.loads.save, data, original=name, force=True)
     _ok(f"Load '{name}' updated")
     _print_mapping(new)
 
@@ -861,8 +653,7 @@ def load_map(
 def load_show(name: str, yaml_: bool = typer.Option(False, "--yaml", help="Print the raw definition."),
               config: str = CONFIG_OPT):
     """Show a load job and its column mapping."""
-    _, cfg = _load_ctx(config)
-    spec = _get_load(cfg, name)
+    spec = _get_load(_svc(config), name)
     if yaml_:
         typer.echo(yaml.safe_dump(spec.model_dump(mode="json", by_alias=True, exclude_none=True), sort_keys=False))
         return
@@ -870,52 +661,48 @@ def load_show(name: str, yaml_: bool = typer.Option(False, "--yaml", help="Print
     typer.secho(f"{spec.name}: {src}  ->  {spec.to.source}.{spec.to.table}", bold=True)
     typer.echo(f"  mode={spec.mode} keys={spec.keys or '-'} batch_size={spec.batch_size} "
                f"max_rejects={spec.max_rejects} unmapped_source_columns={spec.unmapped_source_columns}")
+    typer.echo(f"  duplicate_keys={spec.duplicate_keys} existing_keys={spec.existing_keys}"
+               + (f" safety: min_rows={spec.safety.min_rows} min_percent={spec.safety.min_percent:g}"
+                  if spec.mode == "replace" else ""))
+    t = spec.tracking
+    typer.echo(f"  tracking: on_unchanged={t.on_unchanged} on_header_change={t.on_header_change} "
+               f"stable_seconds={t.stable_seconds} max_age_hours={t.max_age_hours or '-'} archive_keep={t.archive_keep}")
     _print_mapping(spec)
 
 
 @load_app.command("list")
 def load_list(config: str = CONFIG_OPT):
     """List load jobs."""
-    _, cfg = _load_ctx(config)
-    if not cfg.loads:
+    items = _svc(config).loads.list()
+    if not items:
         typer.echo("No loads yet. Create one with 'restforge load create'.")
-    for l in cfg.loads:
-        src = l.from_.endpoint or l.from_.source
-        typer.echo(f"{l.name:<24} {src:<22} -> {l.to.source}.{l.to.table:<28} {l.mode:<8} {len(l.columns)} cols")
+    for l in items:
+        typer.echo(f"{l['name']:<24} {l['from']:<22} -> {l['to_source']}.{l['table']:<28} {l['mode']:<8} "
+                   f"{l['columns']} cols")
 
 
 @load_app.command("remove")
 def load_remove(name: str, config: str = CONFIG_OPT):
     """Delete a load job definition (the table and its data are not touched)."""
-    cfg_path, cfg = _load_ctx(config)
-    _get_load(cfg, name)
-    cfg.loads = [l for l in cfg.loads if l.name != name]
-    _save(cfg, str(cfg_path))
+    svc = _svc(config)
+    _get_load(svc, name)
+    _run(svc.loads.remove, name, force=True)
     _ok(f"Load '{name}' removed")
 
 
 @load_app.command("validate")
 def load_validate(name: str, config: str = CONFIG_OPT):
     """Check the mapping against the real source columns and target table (writes nothing)."""
-    import anyio
-    from .loads import runtime_for, sources_needed
-    cfg_path, cfg = _load_ctx(config)
-    spec = _get_load(cfg, name)
-
-    async def _v():
-        async with runtime_for(cfg, cfg_path.parent, sources_needed(cfg, spec)) as runner:
-            return await runner.validate(spec)
-    try:
-        problems, warnings, rows = anyio.run(_v)
-    except Exception as exc:
-        _fail(exc)
-    for w in warnings:
+    svc = _svc(config)
+    spec = _get_load(svc, name)
+    chk = _run(svc.loads.validate, spec)
+    for w in chk.warnings:
         typer.secho(f"⚠ {w}", fg="yellow")
-    if problems:
-        for p in problems:
+    if chk.problems:
+        for p in chk.problems:
             typer.secho(f"✗ {p}", fg="red", err=True)
         raise typer.Exit(1)
-    _ok(f"Load '{name}' is valid ({len(spec.columns)} columns mapped, source has {len(rows)} rows)")
+    _ok(f"Load '{name}' is valid ({len(spec.columns)} columns mapped, source has {chk.row_count} rows)")
 
 
 @load_app.command("run")
@@ -924,21 +711,14 @@ def load_run(
     dry_run: bool = typer.Option(False, "--dry-run", help="Read, map and validate every row; write nothing."),
     preview: int = typer.Option(0, "--preview", help="Show N rows before/after mapping."),
     as_json: bool = typer.Option(False, "--json", help="Print the run report as JSON."),
+    force: bool = typer.Option(False, "--force", help="Load even if the source is unchanged or its columns changed."),
     config: str = CONFIG_OPT,
 ):
-    """Run a load job. Exit code: 0 = all rows loaded, 2 = loaded with rejects, 1 = failed (rolled back)."""
-    import anyio
-    from .loads import runtime_for, sources_needed
-    cfg_path, cfg = _load_ctx(config)
-    spec = _get_load(cfg, name)
-
-    async def _r():
-        async with runtime_for(cfg, cfg_path.parent, sources_needed(cfg, spec)) as runner:
-            return await runner.run(spec, dry_run=dry_run, preview=preview)
-    try:
-        rep = anyio.run(_r)
-    except Exception as exc:
-        _fail(exc)
+    """Run a load job. Exit code: 0 = loaded, 2 = loaded with rejects, 1 = failed (rolled back),
+    3 = skipped because the source has not changed since the last successful load."""
+    svc = _svc(config)
+    _get_load(svc, name)
+    rep = _run(svc.loads.run, name, dry_run=dry_run, preview=preview, force=force)
     _print_report(rep, as_json)
     raise typer.Exit(rep.exit_code)
 
@@ -947,19 +727,82 @@ def load_run(
 def load_history(name: Optional[str] = typer.Argument(None), last: int = typer.Option(10, "--last"),
                  config: str = CONFIG_OPT):
     """Show recent load runs."""
-    import json as _json
-    cfg_path, _ = _load_ctx(config)
-    path = cfg_path.parent / "logs" / "loads" / "history.jsonl"
-    if not path.exists():
+    runs = _svc(config).loads.history(name, last)
+    if not runs:
         typer.echo("No runs yet.")
         return
-    runs = [_json.loads(l) for l in path.read_text(encoding="utf-8").splitlines() if l.strip()]
-    runs = [r for r in runs if not name or r["load"] == name][-last:]
     for r in runs:
         written = r["inserted"] + r["updated"] + r["upserted"]
         typer.echo(f"{r['started']}  {r['load']:<22} {r['status']:<8} read={r['read']:<6} "
                    f"written={written:<6} rejected={r['rejected']:<5} {r['seconds']}s  {r['run_id']}"
                    + (f"  ✗ {r['error'].splitlines()[0]}" if r.get("error") else ""))
+
+
+@load_app.command("check")
+def load_check(name: str, config: str = CONFIG_OPT):
+    """Has the source changed since the last successful load? (reads the source, writes nothing)
+    Exit code 0 = changed or never loaded, 3 = unchanged."""
+    st = _run(_svc(config).loads.source_status, name)
+    ver = f"v{st['version']}" if st["version"] else "new data (no version yet)"
+    typer.echo(f"source now: {ver}  hash {st['hash'][:12]}  {st['rows']} rows"
+               + (f"  file {st['file']} modified {st['modified']}" if st["file"] else ""))
+    if st["changed"] is None:
+        typer.secho("never loaded successfully", fg="cyan")
+    elif st["changed"]:
+        typer.secho(f"CHANGED since the last load (v{st['last_loaded_version']}, run {st['last_loaded_run']})",
+                    fg="yellow")
+    else:
+        typer.secho(f"unchanged since the last load (v{st['last_loaded_version']}, run {st['last_loaded_run']})",
+                    fg="green")
+    for k, cols in st["header_change"].items():
+        typer.secho(f"  columns {k}: {', '.join(cols)}", fg="yellow")
+    raise typer.Exit(3 if st["changed"] is False else 0)
+
+
+@load_app.command("versions")
+def load_versions(name: str, last: int = typer.Option(20, "--last"), config: str = CONFIG_OPT):
+    """List the versions of a load's source and the runs that read each one."""
+    vs = _run(_svc(config).loads.versions, name)[:last]
+    if not vs:
+        typer.echo("No versions yet – they are recorded by each real run.")
+        return
+    for v in vs:
+        runs = ", ".join(f"{r['run_id']}:{r['status']}" for r in v["runs"][-3:]) or "-"
+        hc = "; ".join(f"{k} {', '.join(c)}" for k, c in v["header_change"].items())
+        typer.echo(f"v{v['version']:<4} {v['first_seen']}  {v['rows']:>7} rows  {v['hash'][:12]}  "
+                   f"{'archived' if v['archived'] else 'no copy ':<8}  {'LOADED' if v['loaded'] else 'not loaded'}"
+                   f"  runs: {runs}" + (f"  columns: {hc}" if hc else ""))
+
+
+@load_app.command("diff")
+def load_diff(name: str, old: int = typer.Argument(..., help="older version number"),
+              new: int = typer.Argument(..., help="newer version number"), config: str = CONFIG_OPT):
+    """Compare two archived source versions (by the load key, or by whole rows)."""
+    d = _run(_svc(config).loads.diff, name, old, new)
+    by = f"key {', '.join(d['key'])}" if d["key"] else "whole rows (no load key mapped from source columns)"
+    typer.secho(f"v{old} -> v{new} compared by {by}", bold=True)
+    typer.echo(f"  added={d['added']} removed={d['removed']} changed={d['changed'] if d['changed'] is not None else '-'}"
+               f" unchanged={d['unchanged']}")
+    for r in d["added_rows"][:10]:
+        typer.secho(f"  + {r}", fg="green")
+    for r in d["removed_rows"][:10]:
+        typer.secho(f"  - {r}", fg="red")
+    for c in d["changed_rows"][:10]:
+        typer.secho(f"  ~ {c['key']}: " + ", ".join(f"{f}: {c['before'][f]!r} -> {c['after'][f]!r}"
+                                                   for f in c["fields"]), fg="yellow")
+
+
+@load_app.command("rejects")
+def load_rejects(run_id: str, last: int = typer.Option(20, "--limit", help="Rows to show."),
+                 config: str = CONFIG_OPT):
+    """Show the rows a run rejected and why."""
+    cols, rows, total = _run(_svc(config).loads.rejects, run_id, last)
+    typer.echo(f"{total} rejected row(s) in run {run_id}" + (f" (showing {len(rows)})" if total > len(rows) else ""))
+    for r in rows:
+        data = {k: v for k, v in r.items() if k not in ("record", "reason")}
+        typer.secho(f"  record {r['record']}: {r['reason']}", fg="red")
+        typer.echo(f"     {data}")
+
 
 
 # ------------------------------------------------------------------ users
@@ -968,40 +811,28 @@ def user_add(username: str, scope: list[str] = typer.Option([], "--scope"),
              password: str = typer.Option(..., prompt=True, hide_input=True, confirmation_prompt=True),
              config: str = CONFIG_OPT):
     """Add a user who can obtain JWTs via POST /auth/token."""
-    if len(password) < 12:
-        raise typer.BadParameter("password must be at least 12 characters")
-    cfg = _load(config)
-    if any(u.username == username for u in cfg.security.users):
-        raise typer.BadParameter(f"user '{username}' exists")
-    cfg.security.users.append(UserRecord(username=username, password_hash=hash_password(password), scopes=scope))
-    _save(cfg, config)
+    try:
+        _svc(config).access.add_user(username, password, scope)
+    except ServiceError as exc:
+        raise typer.BadParameter(str(exc))
     _ok(f"User '{username}' added")
 
 
 @user_app.command("remove")
 def user_remove(username: str, config: str = CONFIG_OPT):
-    cfg = _load(config)
-    cfg.security.users = [u for u in cfg.security.users if u.username != username]
-    _save(cfg, config)
+    _run(_svc(config).access.remove_user, username)
     _ok(f"User '{username}' removed")
 
 
-# --------------------------------------------------------- validate/serve
+# --------------------------------------------------------- validate/call/serve
 @app.command()
 def validate(config: str = CONFIG_OPT):
     """Validate the project (schema, adapters, security rules) without starting the server."""
-    load_dotenv(Path(config).resolve().parent / ".env")
-    from .server import create_app
-    try:
-        create_app(config)
-    except Exception as exc:
-        typer.secho(f"✗ {exc}", fg="red", err=True)
-        raise typer.Exit(1)
-    cfg = _load(config)
-    public = [e.name for e in cfg.endpoints if e.public]
-    _ok(f"{len(cfg.endpoints)} endpoints across {len(cfg.sources)} sources are valid")
-    if public:
-        typer.secho(f"⚠ public endpoints: {', '.join(public)}", fg="yellow")
+    v = _svc(config).runtime.validate()
+    if not v.ok:
+        _fail(Exception(v.message))
+    _ok(v.message)
+    _warn(v.warnings)
 
 
 @app.command()
@@ -1021,72 +852,29 @@ def call(
     Runs with full (admin) rights because whoever can read this project's .env and
     vault already controls it; params are still validated and the call is audited.
     """
-    import getpass
     import json as _json
-    from urllib.parse import quote, urlencode
-
-    from fastapi.testclient import TestClient
-
-    cfg_path = Path(config).resolve()
-    load_dotenv(cfg_path.parent / ".env")
-    cfg = _load(str(cfg_path))
-    ep = cfg.endpoint(endpoint)
-    if ep is None:
+    s = _svc(config)
+    if s.project.config.endpoint(endpoint) is None:
         _fail(Exception(f"no endpoint '{endpoint}' – see 'restforge endpoint list'"))
-
-    # Map NAME=VALUE onto the endpoint's declared params
-    values = _kv(param)
-    where = {p.name: p.location for p in ep.params}
-    unknown = sorted(set(values) - set(where))
-    if unknown:
-        _fail(Exception(f"unknown param(s) {unknown}; '{endpoint}' accepts {sorted(where) or 'none'}"))
-    path = ep.path
-    for n, loc in where.items():
-        if loc == "path":
-            if n not in values:
-                _fail(Exception(f"missing path param '{n}' (use -p {n}=VALUE)"))
-            path = path.replace("{" + n + "}", quote(values[n], safe=""))
-    query = {n: v for n, v in values.items() if where[n] == "query"}
-    if limit is not None:
-        query["limit"] = limit
-    if offset is not None:
-        query["offset"] = offset
-    json_body = {n: v for n, v in values.items() if where[n] == "body"}
+    json_body = None
     if body:
         raw = Path(body[1:]).read_text(encoding="utf-8") if body.startswith("@") else body
         try:
-            json_body.update(_json.loads(raw))
+            json_body = _json.loads(raw)
         except Exception as exc:
             _fail(Exception(f"--body is not valid JSON: {exc}"))
-
-    # In-memory, single-use admin key (never saved) so the call takes the normal pipeline
-    key_id, key = generate_api_key()
-    cfg.security.api_keys.append(ApiKeyRecord(
-        id=key_id, name=f"cli:{getpass.getuser()}", hash=hash_api_key(key), scopes=["*"],
-        created=datetime.now(timezone.utc).isoformat()))
-    if "api_key" not in cfg.security.auth_methods:
-        cfg.security.auth_methods.append("api_key")
-
-    from .server import create_app
-    try:
-        app = create_app(cfg, project_root=cfg_path.parent)
-    except Exception as exc:
-        _fail(exc)
-    url = cfg.server.base_path.rstrip("/") + path + (("?" + urlencode(query)) if query else "")
-    with TestClient(app, raise_server_exceptions=False) as client:
-        resp = client.request(ep.method, url, headers={cfg.security.api_key_header: key},
-                              json=json_body if json_body else None)
-    try:
-        data = resp.json()
-    except Exception:
-        data = {"content": resp.text}
-    ok = resp.status_code < 400
-
+    values = _kv(param)
+    ep = s.project.config.endpoint(endpoint)
+    missing = [p.name for p in ep.params if p.location == "path" and p.name not in values]
+    if missing:
+        _fail(Exception(f"missing path param '{missing[0]}' (use -p {missing[0]}=VALUE)"))
+    res = _run(s.runtime.call, endpoint, values, body=json_body, limit=limit, offset=offset, actor="cli")
+    data = res.data
     if output:
         output.write_text(_json.dumps(data, indent=2, default=str), encoding="utf-8")
     if not quiet:
-        if not ok:
-            typer.secho(f"✗ HTTP {resp.status_code}", fg="red", err=True)
+        if not res.ok:
+            typer.secho(f"✗ HTTP {res.status}", fg="red", err=True)
             typer.echo(_json.dumps(data, indent=2, default=str), err=True)
         elif table and isinstance(data, dict) and isinstance(data.get("items"), list):
             rows = data["items"]
@@ -1101,8 +889,79 @@ def call(
         elif not output:
             typer.echo(_json.dumps(data, indent=2, default=str))
         else:
-            _ok(f"HTTP {resp.status_code} – result written to {output}")
-    raise typer.Exit(0 if ok else 1)
+            _ok(f"HTTP {res.status} – result written to {output}")
+    raise typer.Exit(0 if res.ok else 1)
+
+
+@app.command()
+def docs(topic: Optional[str] = typer.Argument(None, help="Topic, e.g. loads, endpoints, cli-reference."),
+         search: Optional[str] = typer.Option(None, "--search", "-s", help="Find topics containing these words."),
+         part: str = typer.Option("all", "--part", help="all | studio | cli"),
+         plain: bool = typer.Option(False, "--plain", help="Raw Markdown (for redirecting to a file)."),
+         export: Optional[Path] = typer.Option(None, "--export", help="Write the whole guide to one Markdown file.")):
+    """The restforge guide (the same text as Studio's Help screen), with CLI examples."""
+    from . import docs as guide
+    if export:
+        out = ["# restforge guide\n"]
+        for t in guide.topics():
+            t = guide.get(t.slug)
+            out.append(f"\n## {t.title}\n\n{t.intro}\n")
+            if t.studio:
+                out.append(t.studio.replace("## In Studio", "### In Studio") + "\n")
+            if t.cli:
+                out.append(t.cli.replace("## With the CLI", "### With the CLI") + "\n")
+        export.write_text("\n".join(out), encoding="utf-8")
+        _ok(f"Guide written to {export}")
+        return
+    if search:
+        hits = guide.search(search)
+        if not hits:
+            typer.echo(f"Nothing found for '{search}'.")
+        for slug, title, snippet in hits:
+            typer.secho(f"{slug:<18} {title}", bold=True)
+            typer.echo(f"    {snippet}")
+        return
+    if not topic:
+        typer.echo("Topics (restforge docs <topic>):")
+        for t in guide.topics():
+            typer.echo(f"  {t.slug:<18} {t.title}")
+        return
+    try:
+        t = guide.get(topic)
+    except KeyError:
+        names = ", ".join(x.slug for x in guide.topics())
+        raise typer.BadParameter(f"unknown topic '{topic}'. Topics: {names}")
+    pieces = [f"# {t.title}", t.intro] if part == "all" else [f"# {t.title}"]
+    if part in ("all", "studio") and t.studio:
+        pieces.append(t.studio)
+    if part in ("all", "cli") and t.cli:
+        pieces.append(t.cli)
+    text = "\n\n".join(p for p in pieces if p)
+    if plain:
+        typer.echo(text)
+        return
+    try:
+        from rich.console import Console
+        from rich.markdown import Markdown
+        Console().print(Markdown(text, code_theme="ansi_dark"))
+    except Exception:          # pragma: no cover - rich missing
+        typer.echo(text)
+
+
+@app.command()
+def studio(config: str = CONFIG_OPT,
+           web: bool = typer.Option(False, "--web", help="Open in the browser (localhost only) instead of a window."),
+           port: int = typer.Option(8550, help="Port for --web mode."),
+           client_path: Optional[Path] = typer.Option(None, "--client-path",
+                                                      help="Folder containing flet.exe (offline desktop client).")):
+    """Open restforge Studio – the desktop app for sources, credentials, endpoints and keys."""
+    try:
+        from .studio.app import launch
+    except ImportError as exc:
+        _fail(Exception(f"Studio needs the GUI extra: pip install restforge[gui]  ({exc})"))
+    launch(config_path=config, web=web, port=port, client_path=client_path)
+
+
 
 
 @app.command()

@@ -102,9 +102,12 @@ def project(tmp_path, monkeypatch):
 
 
 def test_cli_load_reads_all_pages_and_is_idempotent(project):
-    for _ in range(2):                                   # upsert twice: no duplicates
-        r = runner.invoke(app, ["load", "run", "l1"])
-        assert r.exit_code == 0, r.output
+    r = runner.invoke(app, ["load", "run", "l1"])
+    assert r.exit_code == 0, r.output
+    r = runner.invoke(app, ["load", "run", "l1"])          # same file again: skipped, exit 3
+    assert r.exit_code == 3 and "SKIPPED" in r.output, r.output
+    r = runner.invoke(app, ["load", "run", "l1", "--force"])   # upsert again: no duplicates
+    assert r.exit_code == 0, r.output
     n = sqlite3.connect(project / "data" / "hr.db").execute("select count(*) from tgt").fetchone()[0]
     assert n == 1200
 

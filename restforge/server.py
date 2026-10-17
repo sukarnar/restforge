@@ -161,13 +161,14 @@ def create_app(config: ProjectConfig | str | Path = DEFAULT_CONFIG,
                 for l in config.loads]
 
     @app.post(f"{base}/_loads/{{name}}/run", tags=["loads"])
-    async def run_load(name: str, request: Request, dry_run: bool = False):
-        """Run a load job. 200 = success/partial/dry_run (see 'status'), 422 = failed and rolled back."""
+    async def run_load(name: str, request: Request, dry_run: bool = False, force: bool = False):
+        """Run a load job. 200 = success/partial/dry_run/skipped (see 'status'), 422 = failed and rolled back.
+        'skipped' means the source is unchanged since the last successful load; force=true loads anyway."""
         authenticator.require(request, ["load:run"], public=False)
         spec = config.load_job(name)
         if spec is None:
             raise HTTPException(404, f"No load '{name}'")
-        rep = await load_runner.run(spec, dry_run=dry_run)
+        rep = await load_runner.run(spec, dry_run=dry_run, force=force)
         body = rep.to_dict()
         body.pop("preview", None)
         if body.get("rejects_file"):

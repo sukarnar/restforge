@@ -323,13 +323,32 @@ class LoadTo(BaseModel):
     table: str = Field(pattern=r"^[A-Za-z_][A-Za-z0-9_$#.]{0,127}$")
 
 
+class SourceTracking(BaseModel):
+    """Source versioning and change detection for a load."""
+    on_unchanged: Literal["skip", "load", "fail"] = "skip"     # same data as the last successful load
+    on_header_change: Literal["fail", "warn"] = "fail"         # columns added/removed vs that version
+    stable_seconds: int = Field(0, ge=0, le=3600)              # wait until the file is this old (still copying?)
+    max_age_hours: float | None = Field(None, gt=0)            # fail if the file is older than this
+    archive_keep: int = Field(30, ge=0, le=10000)              # versions kept as compressed copies (0 = none)
+
+
+class LoadSafety(BaseModel):
+    """Guards for kill & fill (mode replace): refuse to empty the table for a short or empty file."""
+    min_rows: int = Field(0, ge=0)                 # the source must have at least this many good rows
+    min_percent: float = Field(0, ge=0, le=1000)   # ... and at least this % of the rows now in the table
+
+
 class LoadSpec(BaseModel):
     name: str = Field(pattern=_NAME)
     description: str = ""
     from_: LoadFrom = Field(alias="from")
     to: LoadTo
     mode: Literal["insert", "replace", "upsert"] = "insert"
-    keys: list[str] = Field(default_factory=list)          # target columns for upsert
+    keys: list[str] = Field(default_factory=list)          # load key (target columns), any mode
+    duplicate_keys: Literal["reject", "first", "last"] = "reject"   # same key twice in the source
+    existing_keys: Literal["reject", "skip", "fail"] = "reject"     # insert mode: key already in the table
+    tracking: SourceTracking = Field(default_factory=SourceTracking)
+    safety: LoadSafety = Field(default_factory=LoadSafety)
     batch_size: int = Field(1000, ge=1, le=50000)
     max_rejects: int = Field(0, ge=0)
     unmapped_source_columns: Literal["ignore", "error"] = "ignore"
@@ -343,12 +362,14 @@ class LoadSpec(BaseModel):
         dupes = {t for t in targets if targets.count(t) > 1}
         if dupes:
             raise ValueError(f"load '{self.name}': target columns mapped twice: {sorted(dupes)}")
-        if self.mode == "upsert":
-            if not self.keys:
-                raise ValueError(f"load '{self.name}': mode 'upsert' needs 'keys'")
-            missing = {k.lower() for k in self.keys} - set(targets)
-            if missing:
-                raise ValueError(f"load '{self.name}': upsert keys {sorted(missing)} are not mapped")
+        if self.mode == "upsert" and not self.keys:
+            raise ValueError(f"load '{self.name}': mode 'upsert' needs 'keys'")
+        missing = {k.lower() for k in self.keys} - set(targets)
+        if missing and self.columns:
+            raise ValueError(f"load '{self.name}': key columns {sorted(missing)} are not mapped")
+        lower = [k.lower() for k in self.keys]
+        if len(set(lower)) != len(lower):
+            raise ValueError(f"load '{self.name}': a key column is listed twice")
         return self
 
 class ServerSettings(BaseModel):

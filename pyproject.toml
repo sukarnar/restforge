@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "restforge"
-version = "0.1.0"
+version = "0.3.0"
 description = "Declarative, secure REST API builder for SQL databases, files, upstream APIs and Python callables"
 requires-python = ">=3.11"
 dependencies = [
@@ -26,6 +26,7 @@ mysql = ["pymysql>=1.1"]
 mssql = ["pyodbc>=5"]
 oracle = ["oracledb>=2.0"]
 keyring = ["keyring>=25"]   # Windows Credential Manager / macOS Keychain
+gui = ["flet==1.0.4", "flet-desktop==1.0.4", "flet-web==1.0.4"]   # restforge studio
 dev = ["pytest>=8"]
 
 [project.scripts]
@@ -35,4 +36,4 @@ restforge = "restforge.cli:app"
 include = ["restforge*"]
 
 [tool.setuptools.package-data]
-restforge = ["static/swagger/*"]
+restforge = ["static/swagger/*", "docs/*.md"]

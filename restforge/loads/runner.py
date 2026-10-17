@@ -8,17 +8,20 @@ import os
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, time as dtime, timezone
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 import anyio
-from sqlalchemy import Boolean, Date, DateTime, Float, Integer, Numeric, String, inspect as sa_inspect
+from sqlalchemy import (Boolean, Date, DateTime, Float, Integer, Numeric, String, and_, func, or_, select,
+                        inspect as sa_inspect)
 from sqlalchemy.exc import SQLAlchemyError
 
 from ..config import ColumnMap, LoadSpec, ProjectConfig
 from ..sources.base import DataSource, ExecutionContext, SourceError
 from .mapping import RowError, RowMapper
+from .versions import Fingerprint, VersionStore, file_sha256, header_change, header_of, rows_hash
 from .writers import make_writer
 
 log = logging.getLogger("restforge.loads")
@@ -34,10 +37,12 @@ class LoadReport:
     run_id: str
     load: str
     mode: str
-    status: str = "running"            # success | partial | failed | dry_run
+    status: str = "running"            # success | partial | failed | dry_run | skipped
     read: int = 0
     mapped: int = 0
     rejected: int = 0
+    dropped: int = 0                   # duplicate keys removed by duplicate_keys: first/last
+    skipped: int = 0                   # rows whose key already exists (existing_keys: skip)
     inserted: int = 0
     updated: int = 0
     upserted: int = 0
@@ -47,14 +52,24 @@ class LoadReport:
     seconds: float = 0.0
     rejects_file: str | None = None
     error: str | None = None
+    keys: list[str] = field(default_factory=list)          # load key used for the checks
+    table_rows: int | None = None                           # rows in the table before (kill & fill)
+    source_hash: str | None = None
+    source_version: int | None = None                       # None in dry runs of new data
+    source_changed: bool | None = None                      # vs the last successful load (None = first)
+    last_loaded_version: int | None = None
+    last_loaded_run: str | None = None
     problems: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     preview: list[dict] = field(default_factory=list)
 
     @property
     def exit_code(self) -> int:
+        """0 ok · 1 failed (rolled back) · 2 loaded with rejects · 3 skipped (source unchanged)"""
         if self.status == "failed":
             return 1
+        if self.status == "skipped":
+            return 3
         return 2 if self.rejected else 0
 
     def to_dict(self) -> dict:
@@ -202,7 +217,13 @@ class LoadRunner:
                 if src.engine.dialect.name in ("sqlite", "postgresql", "mysql", "mariadb"):
                     problems.append(msg + " (required by this database for upsert)")
                 else:
-                    warnings.append(msg + "; duplicates in the table could be updated together")
+                    dup = self._table_duplicate(src, table, [names.get(k, k) for k in spec.keys])
+                    if dup:
+                        problems.append(f"{spec.to.table} already has several rows with the same key "
+                                        f"({dup}); upsert would update all of them – clean the table or "
+                                        f"choose other key columns")
+                    else:
+                        warnings.append(msg + "; checked: the table has no duplicate keys today")
         return table, names, problems, warnings, effective
 
     @staticmethod
@@ -267,46 +288,219 @@ class LoadRunner:
                               read=report.read, rejected=report.rejected,
                               written=report.inserted + report.updated + report.upserted)
 
-    async def run(self, spec: LoadSpec, dry_run: bool = False, preview: int = 0) -> LoadReport:
+    # ------------------------------------------------------------ key checks
+    @staticmethod
+    def _table_duplicate(src, table, cols: list[str]) -> str | None:
+        """One key value that occurs more than once in the table, as text, or None."""
+        try:
+            c = [table.c[n] for n in cols]
+            q = select(*c, func.count().label("n")).group_by(*c).having(func.count() > 1).limit(1)
+            with src.engine.connect() as conn:
+                row = conn.execute(q).first()
+        except Exception as exc:  # noqa: BLE001 – a check must not hide the real problem
+            log.debug("duplicate-key check failed: %s", exc)
+            return None
+        if row is None:
+            return None
+        return ", ".join(f"{n}={v}" for n, v in zip(cols, row[:-1])) + f" appears {row[-1]} times"
+
+    @staticmethod
+    def _existing_keys(src, table, cols: list[str], values: list[tuple]) -> set[tuple]:
+        """Which of ``values`` (key tuples, real column order) are already in the table."""
+        found: set[tuple] = set()
+        c = [table.c[n] for n in cols]
+        uniq = list(dict.fromkeys(values))
+        step = 500 if len(c) == 1 else 100
+        with src.engine.connect() as conn:
+            for b in range(0, len(uniq), step):
+                chunk = uniq[b:b + step]
+                if len(c) == 1:
+                    cond = c[0].in_([v[0] for v in chunk])
+                else:
+                    cond = or_(*[and_(*[col == v for col, v in zip(c, vals)]) for vals in chunk])
+                for row in conn.execute(select(*c).where(cond)):
+                    found.add(tuple(_kn(x) for x in row))
+        return found
+
+    def _table_count(self, spec: LoadSpec, table) -> int:
+        with self._target(spec).engine.connect() as conn:
+            return int(conn.execute(select(func.count()).select_from(table)).scalar() or 0)
+
+    # -------------------------------------------------------- source checks
+    def _file_of(self, spec: LoadSpec):
+        """The file source behind a load (direct, or behind its endpoint), or None."""
+        name = spec.from_.source or self.config.endpoint(spec.from_.endpoint).source
+        src = self.sources.get(name)
+        return src if src is not None and src.type_name == "file" else None
+
+    async def _check_file(self, spec: LoadSpec, report: LoadReport, wait: bool) -> None:
+        src = self._file_of(spec)
+        if src is None:
+            return
+        t = spec.tracking
+        try:
+            path = src._resolved_path()
+            st = path.stat()
+        except (OSError, SourceError):
+            return                                  # read_rows reports a missing file clearly
+        if t.max_age_hours:
+            age_h = (time.time() - st.st_mtime) / 3600
+            if age_h > t.max_age_hours:
+                raise LoadError(f"source file {path.name} was last changed {age_h:.1f} hours ago "
+                                f"(max_age_hours = {t.max_age_hours}); is today's file missing?")
+        if t.stable_seconds:
+            deadline = time.time() + max(60, 3 * t.stable_seconds)
+            while True:
+                st = path.stat()
+                young = time.time() - st.st_mtime
+                if young >= t.stable_seconds:
+                    break
+                if not wait:
+                    report.warnings.append(f"{path.name} changed {young:.0f}s ago; a real run waits until it "
+                                           f"is {t.stable_seconds}s unchanged")
+                    break
+                if time.time() > deadline:
+                    raise LoadError(f"{path.name} is still changing (being copied?); gave up waiting")
+                await anyio.sleep(min(5, t.stable_seconds - young + 0.5))
+
+    def fingerprint(self, spec: LoadSpec, rows: list[dict]) -> Fingerprint:
+        fp = Fingerprint(hash=rows_hash(rows), rows=len(rows), header=header_of(rows),
+                         kind="file" if spec.from_.source else "endpoint")
+        src = self._file_of(spec)
+        if src is not None:
+            try:
+                path = src._resolved_path()
+                st = path.stat()
+                fp.file, fp.size = path.name, st.st_size
+                fp.modified = datetime.fromtimestamp(st.st_mtime, timezone.utc).isoformat(timespec="seconds")
+                fp.file_sha256 = file_sha256(path)
+            except (OSError, SourceError):
+                pass
+        return fp
+
+    def versions(self, name: str) -> VersionStore:
+        return VersionStore(self.dir, name)
+
+    def last_loaded(self, name: str) -> dict | None:
+        """The latest run of this load that wrote data (success or partial)."""
+        path = self.dir / "history.jsonl"
+        if not path.exists():
+            return None
+        last = None
+        for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if r.get("load") == name and r.get("status") in ("success", "partial") and r.get("source_hash"):
+                last = r
+        return last
+
+    # -------------------------------------------------------------------- run
+    async def run(self, spec: LoadSpec, dry_run: bool = False, preview: int = 0, force: bool = False) -> LoadReport:
         run_id = datetime.now().strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
         report = LoadReport(run_id=run_id, load=spec.name, mode=spec.mode,
                             started=datetime.now(timezone.utc).isoformat(timespec="seconds"))
         t0 = time.perf_counter()
         lock = None
+        record = not dry_run
         try:
             if not dry_run:
                 lock = self._lock(spec.name)
-            # 1. extract
+            # 1. extract (a file must be complete and recent enough)
+            await self._check_file(spec, report, wait=not dry_run)
             rows = await self.read_rows(spec)
             report.read = len(rows)
-            # 2. validate mapping against source header and target table
+
+            # 2. version the source and compare with the last successful load
+            fp = await anyio.to_thread.run_sync(self.fingerprint, spec, rows)
+            store = self.versions(spec.name)
+            report.source_hash = fp.hash
+            last = self.last_loaded(spec.name)
+            last_v = store.find(last["source_hash"]) if last else None
+            if last:
+                report.source_changed = last["source_hash"] != fp.hash
+                report.last_loaded_version = last.get("source_version")
+                report.last_loaded_run = last.get("run_id")
+            known = store.find(fp.hash)
+            if not dry_run:
+                known = await anyio.to_thread.run_sync(store.add, fp, rows, run_id, spec.tracking.archive_keep)
+            report.source_version = known.version if known else None
+            if last_v is not None:
+                hc = header_change(last_v.header, fp.header)
+                if hc:
+                    msg = (f"source columns changed since v{last_v.version} (last loaded): "
+                           + "; ".join(f"{k}: {', '.join(v)}" for k, v in hc.items()))
+                    if spec.tracking.on_header_change == "fail" and not force:
+                        raise LoadError(msg + " – check the mapping, then run with --force (Studio: "
+                                              "Run anyway) or set on_header_change: warn")
+                    report.warnings.append(msg)
+            if report.source_changed is False:
+                where = f"v{report.last_loaded_version} (run {report.last_loaded_run})"
+                if dry_run:
+                    report.warnings.append(f"source unchanged since the last load {where}"
+                                           + ("; a real run would skip it" if spec.tracking.on_unchanged == "skip"
+                                              else ""))
+                elif not force and spec.tracking.on_unchanged == "skip":
+                    report.status = "skipped"
+                    report.error = f"source unchanged since the last load {where}; nothing to do"
+                    return report
+                elif not force and spec.tracking.on_unchanged == "fail":
+                    raise LoadError(f"source unchanged since the last load {where}")
+                else:
+                    report.warnings.append(f"source unchanged since the last load {where}; loading anyway")
+
+            # 3. validate mapping against source header and target table
             table, names, p1, w1, effective = await anyio.to_thread.run_sync(self.inspect_target, spec)
             p2, w2 = self.check_source_columns(spec, rows)
-            report.problems, report.warnings = p1 + p2, w1 + w2
+            report.problems, report.warnings = p1 + p2, report.warnings + w1 + w2
             if report.problems:
                 raise LoadError("mapping is not valid:\n  - " + "\n  - ".join(report.problems))
-            # 3. map every row first – nothing is written if there are too many rejects
+
+            # 4. map every row first – nothing is written if there are too many rejects
             mapper = RowMapper(spec.model_copy(update={"columns": effective}), run_id)
-            good: list[dict[str, Any]] = []
+            mapped_rows: list[tuple[int, dict, dict]] = []
             rejects: list[tuple[int, str, dict]] = []
             for i, row in enumerate(rows, start=1):
                 try:
-                    mapped = mapper.map_row(row)
-                    good.append({names[k]: v for k, v in mapped.items()})
-                    if len(report.preview) < preview:
-                        report.preview.append({"record": i, "source": row, "target": mapped})
+                    mapped_rows.append((i, row, mapper.map_row(row)))
                 except RowError as exc:
                     rejects.append((i, str(exc), row))
+
+            # 5. load key checks: empty, duplicated in the source, already in the table
+            key_targets = self._key_targets(spec, table, names, report)
+            if key_targets:
+                mapped_rows = await self._check_keys(spec, table, names, key_targets, mapped_rows, rejects, report)
+            rejects.sort(key=lambda r: r[0])
+            for i, row, mapped in mapped_rows:
+                if len(report.preview) >= preview:
+                    break
+                report.preview.append({"record": i, "source": row, "target": mapped})
+            good = [{names[k]: v for k, v in m.items()} for _, _, m in mapped_rows]
             report.mapped, report.rejected = len(good), len(rejects)
             self.dir.mkdir(parents=True, exist_ok=True)
             self._write_rejects(report, rejects)
             if report.rejected > spec.max_rejects:
                 raise LoadError(f"{report.rejected} row(s) rejected (max_rejects = {spec.max_rejects}); "
                                 f"nothing was written. See {report.rejects_file}")
+
+            # 6. kill & fill safety: never empty the table for a short or empty file
+            if spec.mode == "replace":
+                report.table_rows = await anyio.to_thread.run_sync(self._table_count, spec, table)
+                sf = spec.safety
+                if len(good) < sf.min_rows:
+                    raise LoadError(f"kill & fill refused: {len(good)} row(s) to load, safety.min_rows is "
+                                    f"{sf.min_rows}; the table ({report.table_rows} rows) was not touched")
+                if sf.min_percent and report.table_rows and len(good) * 100 < report.table_rows * sf.min_percent:
+                    pct = len(good) * 100 / report.table_rows
+                    raise LoadError(f"kill & fill refused: {len(good)} row(s) would replace {report.table_rows} "
+                                    f"({pct:.0f}%, safety.min_percent is {sf.min_percent:g}%); "
+                                    f"the table was not touched")
             if dry_run:
                 report.status = "dry_run"
                 return report
-            # 4. load – one transaction for the whole run
+
+            # 7. load – one transaction for the whole run
             keys = [names[k] if k in names else k for k in spec.keys]
             target = self._target(spec)
 
@@ -340,5 +534,86 @@ class LoadRunner:
             report.seconds = round(time.perf_counter() - t0, 2)
             if lock:
                 lock.unlink(missing_ok=True)
-            if not dry_run:
+            if record:
                 self._record(report)
+
+    def _key_targets(self, spec: LoadSpec, table, names: dict[str, str], report: LoadReport) -> list[str]:
+        """Mapping target names of the load key: spec.keys, or else the table's primary key if mapped."""
+        by_lower = {t.lower(): t for t in names}
+        if spec.keys:
+            out = [by_lower[k.lower()] for k in spec.keys if k.lower() in by_lower]
+        else:
+            pk = [c.name for c in table.primary_key.columns]
+            real_to_target = {v.lower(): k for k, v in names.items()}
+            out = [real_to_target[c.lower()] for c in pk if c.lower() in real_to_target]
+            if not pk or len(out) != len(pk):
+                return []
+            report.warnings.append(f"no load key set; using the table's primary key ({', '.join(pk)}) "
+                                   f"for duplicate checks")
+        report.keys = out
+        return out
+
+    async def _check_keys(self, spec, table, names, key_targets, mapped_rows, rejects, report):
+        def label(m):
+            return ", ".join(f"{k}={m.get(k)}" for k in key_targets)
+
+        def kv(m):
+            return tuple(_kn(m[k]) for k in key_targets)
+
+        with_key = []
+        for i, row, m in mapped_rows:
+            if any(m.get(k) is None for k in key_targets):
+                rejects.append((i, f"key column empty ({label(m)})", row))
+            else:
+                with_key.append((i, row, m))
+        groups: dict[tuple, list] = {}
+        for item in with_key:
+            groups.setdefault(kv(item[2]), []).append(item)
+        kept: list[tuple[int, dict, dict]] = []
+        for items in groups.values():
+            if len(items) == 1:
+                kept.append(items[0])
+            elif spec.duplicate_keys == "reject":   # we cannot know which copy is right: reject all
+                recs = ", ".join(str(i) for i, _, _ in items)
+                for i, row, m in items:
+                    rejects.append((i, f"duplicate key ({label(m)}) in source records {recs}", row))
+            else:
+                kept.append(items[0] if spec.duplicate_keys == "first" else items[-1])
+                report.dropped += len(items) - 1
+        kept.sort(key=lambda t: t[0])
+        if spec.mode == "insert" and kept:
+            cols = [names[k] for k in key_targets]
+            values = [tuple(m[k] for k in key_targets) for _, _, m in kept]
+            try:
+                found = await anyio.to_thread.run_sync(self._existing_keys, self._target(spec), table, cols, values)
+            except SQLAlchemyError as exc:
+                raise LoadError(f"could not check existing keys in {spec.to.table}: "
+                                f"{str(getattr(exc, 'orig', exc)).splitlines()[0][:200]}") from None
+            if found:
+                if spec.existing_keys == "fail":
+                    raise LoadError(f"{len(found)} key(s) already exist in {spec.to.table} "
+                                    f"(existing_keys: fail); nothing was written")
+                still = []
+                for i, row, m in kept:
+                    if kv(m) in found:
+                        if spec.existing_keys == "skip":
+                            report.skipped += 1
+                        else:
+                            rejects.append((i, f"key ({label(m)}) already exists in {spec.to.table}", row))
+                    else:
+                        still.append((i, row, m))
+                kept = still
+        return kept
+
+
+def _kn(v: Any) -> Any:
+    """Normalise a key value so source and database values compare equal (Oracle DATE, NUMBER, CHAR)."""
+    if isinstance(v, datetime) and v.tzinfo is None and v.time() == dtime(0):
+        return v.date()
+    if isinstance(v, Decimal) and v == v.to_integral_value():
+        return int(v)
+    if isinstance(v, float) and v.is_integer():
+        return int(v)
+    if isinstance(v, str):
+        return v.rstrip()
+    return v

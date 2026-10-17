@@ -15,6 +15,12 @@ import time
 from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Request
+from fastapi.encoders import jsonable_encoder
+from decimal import Decimal as _Decimal
+
+# database NUMBER/NUMERIC values: whole numbers stay integers, others become JSON numbers
+_ENCODERS = {_Decimal: lambda d: int(d) if d == d.to_integral_value() and abs(d) < 2 ** 53 else float(d),
+             bytes: lambda b: b.hex()}
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ValidationError, create_model
 
@@ -175,7 +181,7 @@ class EndpointBuilder:
                 ctx = ExecutionContext(ep, params, principal, limit, offset, request_id)
                 data = await source.execute(ctx)
                 status_code = 201 if ep.method == "POST" and ep.operation == "create" else 200
-                return JSONResponse(data, status_code=status_code)
+                return JSONResponse(jsonable_encoder(data, custom_encoder=_ENCODERS), status_code=status_code)
             except HTTPException as exc:
                 status_code = exc.status_code
                 raise

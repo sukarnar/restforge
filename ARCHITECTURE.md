@@ -15,6 +15,7 @@ The framework combines a small number of well-known patterns, each with one job:
 | Connection secrets | **Credential Manager façade over a provider chain (Strategy)** – vault, env, OS keyring, HashiCorp Vault – with typed credentials and builders that turn them into SQLAlchemy URLs / HTTP auth. | `credentials/` |
 | Loading data into tables | **Pipeline** (extract → map → validate → load → report) run by a **Template Method** runner; **Strategy** writers per mode/dialect (insert, replace, MERGE / ON CONFLICT / ON DUPLICATE KEY upsert); mapping checked as a **Specification** against the CSV header and the reflected table | `loads/` |
 | Swappable infrastructure | **Interface + dependency injection** for rate limiter, audit sink, sources. | `RateLimiter`, `create_app(...)` |
+| CLI and GUI share one implementation | **Service layer** (`services/`): `Project` (validated, atomic, backed-up saves with outside-edit detection and in-memory rollback) and `SourceService`, `EndpointService`, `CredentialService`, `AccessService`, `RuntimeService`, `LoadService`. The CLI and Studio are thin adapters; Studio screens use **MVVM-style** view-models | `services/`, `studio/` |
 | Wiring | **Application Factory**. `create_app(config)` builds a fully isolated app – easy to test, embed, or run multiple tenants. | `server.py` |
 
 ### Why this combination
@@ -56,6 +57,8 @@ restforge/
     mapping.py       Row mapping: rename, transforms, typed casts, constants, auto-map
     writers.py       Insert / Replace / Upsert strategies (dialect-specific MERGE / ON CONFLICT)
     runner.py        LoadRunner: lock, read (all pages), validate vs table, rejects, one transaction, history
+  services/          Use cases shared by CLI and Studio (no printing, no prompts)
+  studio/            Flet 1.0 desktop/web app: app.py (shell, launcher), viewmodels.py, views/
   security/
     auth.py          Principal, AuthStrategy, ApiKeyStrategy, JwtStrategy, Authenticator
     hashing.py       API-key + scrypt password hashing

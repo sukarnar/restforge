@@ -112,11 +112,39 @@ Non-interactive (CI): `restforge cred add db -t database ... --secret-from-env p
 | `cred init/types/add/list/show/rotate/test/rekey/remove` | Connection credentials (see above) |
 | `source set-credential SOURCE [CRED]` | Attach/detach a credential on an existing source |
 | `validate` | Full build of the app without serving – use in CI |
-| `load create/map/show/list/validate/run/history/remove` | Load jobs: CSV/endpoint → mapped columns → database table |
+| `studio [--web] [--client-path DIR]` | Open restforge Studio (GUI) |
+| `docs [TOPIC]` | The user guide in the terminal (same text as Studio's Help screen); `docs cli-reference` lists every command |
+| `source test NAME` · `endpoint set-access NAME --public/--scope` | Test a source; change who may call an endpoint |
+| `load create/map/show/list/validate/run/history/rejects/check/versions/diff/remove` | Load jobs: CSV/endpoint → mapped columns → database table |
 | `call ENDPOINT [-p NAME=VALUE]… [--body JSON] [--table] [-o FILE]` | Run an endpoint directly, no server (scripts, schedulers); exit code 0/1 |
 | `serve [--reload] [--workers]` | Run with uvicorn |
 
 All commands accept `-c/--config` to point at another project file.
+
+## restforge Studio (desktop app)
+A Flet-based GUI over the same service layer as the CLI – anything done in Studio is exactly what the
+equivalent CLI command does (same validation, same files, same audit log).
+
+```powershell
+pip install -e .[gui]                 # adds Flet 1.0.4 (offline: see the Studio add-on bundle)
+cd C:\apps\hr-api
+restforge studio                      # desktop window
+restforge studio --web                # browser on this PC only (127.0.0.1 + one-time token link)
+restforge studio --client-path C:\tools\flet-client\flet   # pre-downloaded desktop client (offline)
+```
+
+| Screen | What you can do |
+|---|---|
+| Dashboard | **Getting started** checklist (each step links to its screen), counts, expiring credentials/keys, public endpoints, recent load runs, **Validate project** |
+| Sources | add/edit/delete SQL, file, REST and callable sources; **Browse** copies a file into `data\`; **Test** connects or previews the first rows |
+| Credentials | typed forms (database fields follow the driver), masked secrets, **Test**, **Rotate**, expiry badges, create the vault master key |
+| Endpoints | **builder** for every source type: SQL table (CRUD wizard), custom SQL query (`:binds` become parameters, **Test query**), file (filter/key fields), REST upstream, Python function; parameter grid (type, location, required, default, min/max, length, allowed values, pattern); scopes or public, rate limit; **Try it** in-process; YAML, CLI command and PowerShell/curl snippets; Duplicate; next-step prompts (API key with the right scope, Try it, Create a load) |
+| Loads | create load jobs, **mapping designer** (one line per table column, Auto-map, constants, date formats, clean-up/lookup options, upsert keys), **Validate**, **Preview** (dry run, before/after rows), **Run** with result summary, history and a **rejected-rows viewer** |
+| API keys | create keys with a scope picker, **show-once** dialog with Copy (clipboard cleared after 60 s), revoke; users for JWT login |
+| Help | the full guide – every topic in two tabs, **In Studio** and **With the CLI** (copyable PowerShell examples), search, and a CLI reference generated from the installed commands. Every screen has a **?** button to its topic |
+
+Studio notices when `restforge.yaml` is changed elsewhere (CLI, Notepad) and offers **Reload**. Every
+save is validated, written atomically and the previous version kept as `restforge.yaml.bak`.
 
 ## Running endpoints without a server
 ```bash
@@ -151,7 +179,58 @@ restforge load validate transfers-to-db                 # vs CSV header + real t
 restforge load run transfers-to-db --dry-run --preview 3
 restforge load run transfers-to-db                      # exit 0 = ok, 2 = loaded with rejects, 1 = failed/rolled back
 restforge load history transfers-to-db
+restforge load rejects 20261017-070035-419658          # rows a run rejected and why
+restforge load check transfers-to-db                    # has the source changed since the last load? (exit 3 = no)
+restforge load versions transfers-to-db                 # every version of the source and the runs that read it
+restforge load diff transfers-to-db 3 4                 # rows added / removed / changed between two versions
+restforge load run transfers-to-db --force              # load even though the source is unchanged
 ```
+
+**Exit codes of `load run`** (for Stonebranch): `0` loaded · `2` loaded, some rows rejected · `1` failed,
+nothing written · `3` skipped – the source has not changed since the last successful load.
+
+### Load key, modes and kill & fill
+* **Load key** (`keys`, any mode; Studio: the *Key* column of the mapping grid). Checked before anything is
+  written, even when the table has no primary key: an empty key is rejected; a key found twice in the source
+  is handled by `duplicate_keys` (`reject` all copies – default, `first`, `last`); in Append mode a key
+  already in the table is handled by `existing_keys` (`reject` – default, `skip`, `fail`). With no key set,
+  the table's primary key is used when all its columns are mapped. Upsert also checks that the key is not
+  duplicated inside the table.
+* **Modes**: `insert` = Append · `replace` = **Kill & fill** (DELETE all rows + INSERT in one transaction; a
+  failure keeps the old rows) · `upsert`.
+* **Kill & fill safety** (`safety.min_rows`, `safety.min_percent`): refuse to empty the table when the file
+  has fewer rows than N, or less than X % of the rows currently in the table.
+
+```powershell
+restforge load map transfers-to-db --mode replace --key transfer_id --duplicate-keys reject --min-percent 50
+restforge load map transfers-to-db --mode insert --existing-keys skip      # "insert new only"
+```
+
+### Source versioning and change detection
+Every real run fingerprints the source (hash of the rows read, file size, modified time, SHA-256 of the file,
+column list) and stores each distinct content as a numbered version in `logs\loads\versions\<load>.jsonl`,
+with a compressed copy in `logs\loads\archive\<load>\` (last `archive_keep`, default 30). The run report
+and history show the version and whether it changed since the last successful load.
+
+| `tracking:` setting | Default | Meaning |
+|---|---|---|
+| `on_unchanged` | `skip` | same data as the last successful load: `skip` (exit 3), `load`, `fail` |
+| `on_header_change` | `fail` | columns added/removed since that version: `fail` or `warn` |
+| `stable_seconds` | `0` | wait until the file has not changed for N seconds (still being copied) |
+| `max_age_hours` | none | fail if the file was last changed longer ago (yesterday's file?) |
+| `archive_keep` | `30` | versions kept as copies for `load diff` (0 = fingerprint only) |
+
+CLI: `restforge load map NAME --on-unchanged load --stable-seconds 60 --max-age-hours 26 --archive-keep 10`.
+REST: `POST /api/_loads/{name}/run?force=true`.
+
+In Studio the same job is built on the **Loads** screen: pick the file source or endpoint, the target SQL
+source and table (**Browse tables**), press **Read columns**, then **Auto-map** and fix the lines the grid
+flags (red = must fix, yellow = check), and tick the **Key** columns. *How rows are written* holds the mode,
+the key checks and the kill & fill safety; *Source versions* holds the change-detection settings, **Check
+source now**, the version list and **Compare** (rows added / removed / changed between versions).
+**Preview** maps every row without writing; **Run** writes in one transaction and shows the counts; a run
+skipped because the source is unchanged offers **Run anyway**. **Check sources** on the Loads list shows
+for every load whether its source changed since it was last loaded.
 
 | Setting | Values |
 |---|---|
